@@ -10,6 +10,8 @@ package tui
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -56,7 +58,8 @@ type Model struct {
 	groups   []Group
 	visible  []int // indices into groups, current filter
 	selected map[int]bool
-	cursor   int
+	cursor   int // position within m.visible
+	scroll   int // first visible row of m.visible
 
 	filter textinput.Model
 	target textinput.Model
@@ -64,15 +67,14 @@ type Model struct {
 	width  int
 	height int
 
+	// Tab-completion state for the target-path screen.
+	targetSuggestions []string
+	targetCompleteFor string // input value the suggestions correspond to
+
 	plans   []session.Plan
 	reports []session.Report
 	runID   string
 	err     error
-
-	scanResult struct {
-		groups []Group
-		err    error
-	}
 }
 
 // NewModel constructs a ready-to-run TUI model.
@@ -167,9 +169,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		m.adjustScroll()
 	case scanDoneMsg:
 		m.groups = msg.groups
-		m.scanResult.err = msg.err
 		m.refilter()
 		m.phase = phaseList
 		return m, nil
@@ -213,12 +215,44 @@ func (m Model) handleListKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.cursor > 0 {
 			m.cursor--
 		}
+		m.adjustScroll()
 		return m, nil
 	case "down", "ctrl+n":
 		if m.cursor < len(m.visible)-1 {
 			m.cursor++
 		}
+		m.adjustScroll()
 		return m, nil
+	case "pgup":
+		step := m.listCapacity()
+		m.cursor -= step
+		if m.cursor < 0 {
+			m.cursor = 0
+		}
+		m.adjustScroll()
+		return m, nil
+	case "pgdown":
+		step := m.listCapacity()
+		m.cursor += step
+		if m.cursor >= len(m.visible) {
+			m.cursor = max0(len(m.visible) - 1)
+		}
+		m.adjustScroll()
+		return m, nil
+	case "g":
+		// only act as list-nav when filter is empty; otherwise let it through
+		// so the user can type "g" inside the filter.
+		if m.filter.Value() == "" {
+			m.cursor = 0
+			m.adjustScroll()
+			return m, nil
+		}
+	case "G":
+		if m.filter.Value() == "" {
+			m.cursor = max0(len(m.visible) - 1)
+			m.adjustScroll()
+			return m, nil
+		}
 	case " ", "tab":
 		if len(m.visible) == 0 {
 			return m, nil
@@ -261,12 +295,29 @@ func (m Model) handleTargetKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.target.Blur()
 		m.filter.Focus()
 		return m, textinput.Blink
+	case "tab":
+		completed, suggestions := completePath(m.target.Value())
+		if completed != m.target.Value() {
+			m.target.SetValue(completed)
+			m.target.SetCursor(len(completed))
+			// After accepting a longer prefix, drop the menu so the user
+			// can see they made progress; a second Tab repopulates it.
+			m.targetSuggestions = nil
+			m.targetCompleteFor = ""
+		} else if len(suggestions) > 1 {
+			m.targetSuggestions = suggestions
+			m.targetCompleteFor = m.target.Value()
+		} else {
+			m.targetSuggestions = nil
+			m.targetCompleteFor = ""
+		}
+		return m, nil
 	case "enter":
 		newCWD := strings.TrimSpace(m.target.Value())
 		if newCWD == "" {
 			return m, nil
 		}
-		// Build plans.
+		newCWD = expandTilde(newCWD)
 		plans, err := buildPlans(m, newCWD)
 		if err != nil {
 			m.err = err
@@ -276,8 +327,14 @@ func (m Model) handleTargetKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.phase = phaseConfirm
 		return m, nil
 	}
+	prev := m.target.Value()
 	newTarget, cmd := m.target.Update(msg)
 	m.target = newTarget
+	// Drop stale completion menu the moment the buffer changes.
+	if m.target.Value() != prev {
+		m.targetSuggestions = nil
+		m.targetCompleteFor = ""
+	}
 	return m, cmd
 }
 
@@ -364,6 +421,46 @@ func (m *Model) refilter() {
 	if m.cursor >= len(m.visible) {
 		m.cursor = max0(len(m.visible) - 1)
 	}
+	m.scroll = 0
+	m.adjustScroll()
+}
+
+// listCapacity returns the number of group items that fit in the list view at
+// the current terminal height. Each group renders as two lines (title +
+// description); the chrome above and below the list is fixed.
+func (m Model) listCapacity() int {
+	// chrome: frame padding (top+bottom = 2) + title + filter line + blank +
+	// trailing blank + help line + mode line = 7 fixed lines.
+	const chrome = 9
+	if m.height <= 0 {
+		return 8 // sensible default before first WindowSizeMsg arrives
+	}
+	cap := (m.height - chrome) / 2
+	if cap < 1 {
+		cap = 1
+	}
+	return cap
+}
+
+// adjustScroll keeps the cursor inside the visible window.
+func (m *Model) adjustScroll() {
+	cap := m.listCapacity()
+	if m.cursor < m.scroll {
+		m.scroll = m.cursor
+	}
+	if m.cursor >= m.scroll+cap {
+		m.scroll = m.cursor - cap + 1
+	}
+	if m.scroll < 0 {
+		m.scroll = 0
+	}
+	maxScroll := len(m.visible) - cap
+	if maxScroll < 0 {
+		maxScroll = 0
+	}
+	if m.scroll > maxScroll {
+		m.scroll = maxScroll
+	}
 }
 
 func (m Model) anySelected() bool {
@@ -416,17 +513,14 @@ func (m Model) viewList() string {
 		fmt.Fprintln(&b, dimStyle.Render("press q to quit."))
 		return b.String()
 	}
-	maxRows := m.height - 9
-	if maxRows < 5 {
-		maxRows = 10
-	}
-	start := 0
-	if m.cursor >= maxRows {
-		start = m.cursor - maxRows + 1
-	}
-	end := start + maxRows
+	cap := m.listCapacity()
+	start := m.scroll
+	end := start + cap
 	if end > len(m.visible) {
 		end = len(m.visible)
+	}
+	if start > end {
+		start = end
 	}
 	for vi := start; vi < end; vi++ {
 		idx := m.visible[vi]
@@ -448,8 +542,17 @@ func (m Model) viewList() string {
 		fmt.Fprintln(&b, line)
 	}
 	fmt.Fprintln(&b, "")
+	if len(m.visible) > end {
+		fmt.Fprintln(&b, dimStyle.Render(fmt.Sprintf(
+			"… %d more below (pgdn / G to jump)", len(m.visible)-end)))
+	} else if start > 0 {
+		fmt.Fprintln(&b, dimStyle.Render(fmt.Sprintf(
+			"… %d more above (pgup / g to jump)", start)))
+	} else {
+		fmt.Fprintln(&b, "")
+	}
 	fmt.Fprintln(&b, dimStyle.Render(
-		"space: select  enter: continue  ctrl+a: select all  ctrl+x: clear  q: quit"))
+		"↑/↓ pgup/pgdn g/G  space: select  enter: continue  ctrl+a: all  ctrl+x: clear  q: quit"))
 	fmt.Fprintf(&b, "%s %s\n",
 		dimStyle.Render("mode:"),
 		accentStyle.Render(strings.ToUpper(m.mode.String())))
@@ -468,10 +571,17 @@ func (m Model) viewTarget() string {
 	}
 	fmt.Fprintln(&b, dimStyle.Render(fmt.Sprintf("%d group(s) selected.", count)))
 	fmt.Fprintln(&b, "")
-	fmt.Fprintln(&b, "Enter the new cwd (absolute path):")
+	fmt.Fprintln(&b, "Enter the new cwd (absolute path, ~ supported):")
 	fmt.Fprintln(&b, m.target.View())
+	if len(m.targetSuggestions) > 0 {
+		fmt.Fprintln(&b, "")
+		fmt.Fprintln(&b, dimStyle.Render(fmt.Sprintf("%d candidates:", len(m.targetSuggestions))))
+		for _, s := range m.targetSuggestions {
+			fmt.Fprintln(&b, "  "+accentStyle.Render(s))
+		}
+	}
 	fmt.Fprintln(&b, "")
-	fmt.Fprintln(&b, dimStyle.Render("enter: confirm  esc: back  ctrl+c: quit"))
+	fmt.Fprintln(&b, dimStyle.Render("tab: complete  enter: confirm  esc: back  ctrl+c: quit"))
 	if m.err != nil {
 		fmt.Fprintln(&b, errStyle.Render("error: "+m.err.Error()))
 	}
@@ -563,4 +673,97 @@ func max0(x int) int {
 		return 0
 	}
 	return x
+}
+
+// completePath returns the bash-style tab completion of input. It returns the
+// completed input (longest common prefix when there are multiple matches) and
+// — when more than one match remains — the candidate basenames sorted
+// alphabetically for display below the prompt.
+//
+// Empty input returns unchanged with no candidates. Tilde at the start is
+// expanded for the filesystem lookup but collapsed back into the result.
+func completePath(input string) (string, []string) {
+	if input == "" {
+		return input, nil
+	}
+	sep := string(os.PathSeparator)
+	idx := strings.LastIndex(input, sep)
+	var prefix, frag string
+	if idx < 0 {
+		prefix, frag = "", input
+	} else {
+		prefix, frag = input[:idx+1], input[idx+1:]
+	}
+	// Resolve the directory we'll list.
+	dir := expandTilde(prefix)
+	if dir == "" {
+		dir = "."
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return input, nil
+	}
+	var matches []string
+	isDir := map[string]bool{}
+	for _, e := range entries {
+		name := e.Name()
+		// Match bash: hide dotfiles unless the user is explicitly typing one.
+		if frag == "" && strings.HasPrefix(name, ".") {
+			continue
+		}
+		if strings.HasPrefix(name, frag) {
+			matches = append(matches, name)
+			isDir[name] = e.IsDir()
+		}
+	}
+	if len(matches) == 0 {
+		return input, nil
+	}
+	sort.Strings(matches)
+	if len(matches) == 1 {
+		result := prefix + matches[0]
+		if isDir[matches[0]] {
+			result += sep
+		}
+		return result, nil
+	}
+	lcp := longestCommonPrefix(matches)
+	completed := prefix + lcp
+	if completed == input {
+		// Buffer is already at the longest common prefix; surface candidates.
+		return input, matches
+	}
+	return completed, matches
+}
+
+// expandTilde turns "~" or "~/foo" into "$HOME" / "$HOME/foo". Anything else
+// is returned unchanged.
+func expandTilde(p string) string {
+	if p == "~" || strings.HasPrefix(p, "~"+string(os.PathSeparator)) {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return p
+		}
+		if p == "~" {
+			return home
+		}
+		return filepath.Join(home, p[2:])
+	}
+	return p
+}
+
+func longestCommonPrefix(s []string) string {
+	if len(s) == 0 {
+		return ""
+	}
+	p := s[0]
+	for _, x := range s[1:] {
+		for !strings.HasPrefix(x, p) {
+			p = p[:len(p)-1]
+			if p == "" {
+				return ""
+			}
+		}
+	}
+	return p
 }

@@ -1,6 +1,7 @@
 package adapter
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -392,14 +393,20 @@ func rewriteGeminiChatHeader(path, oldHash, newHash, oldCWD, newCWD string) erro
 		if err := json.Unmarshal(line, &m); err != nil {
 			return line
 		}
+		// projectHash → surgical byte-replace so the rest of the header
+		// metadata (key order, escape style) survives unchanged.
 		if cur, ok := m["projectHash"]; ok {
 			var s string
 			if json.Unmarshal(cur, &s) == nil && s == oldHash {
-				nb, _ := json.Marshal(newHash)
-				m["projectHash"] = nb
+				oldPat, newPat, perr := jsonFieldPattern("projectHash", oldHash, newHash)
+				if perr == nil {
+					line = bytes.Replace(line, oldPat, newPat, 1)
+				}
 			}
 		}
-		// rewrite directories[] entries that start with oldCWD
+		// directories[] needs structural editing (array element rewrite),
+		// so re-parse, transform, and serialize without HTML escaping. The
+		// first JSONL line is metadata only — reordering its keys is fine.
 		if cur, ok := m["directories"]; ok {
 			var dirs []string
 			if json.Unmarshal(cur, &dirs) == nil {
@@ -411,16 +418,23 @@ func rewriteGeminiChatHeader(path, oldHash, newHash, oldCWD, newCWD string) erro
 					}
 				}
 				if changed {
-					nb, _ := json.Marshal(dirs)
-					m["directories"] = nb
+					// Re-parse the (possibly already-patched) line, then
+					// substitute the directories field.
+					var fresh map[string]json.RawMessage
+					if err := json.Unmarshal(line, &fresh); err == nil {
+						nb, err := marshalNoHTMLEscape(dirs, "")
+						if err == nil {
+							fresh["directories"] = nb
+							out, err := marshalNoHTMLEscape(fresh, "")
+							if err == nil {
+								return out
+							}
+						}
+					}
 				}
 			}
 		}
-		out, err := json.Marshal(m)
-		if err != nil {
-			return line
-		}
-		return out
+		return line
 	})
 }
 
@@ -456,7 +470,7 @@ func updateGeminiProjectsJSON(oldCWD, newCWD, newSlug string, copyMode bool) err
 	wrap := struct {
 		Projects map[string]string `json:"projects"`
 	}{Projects: registry}
-	out, err := json.MarshalIndent(wrap, "", "  ")
+	out, err := marshalNoHTMLEscape(wrap, "  ")
 	if err != nil {
 		return err
 	}

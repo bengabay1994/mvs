@@ -26,9 +26,9 @@ import (
 
 // Manifest is the on-disk undo record for a single migration run.
 type Manifest struct {
-	ID        string         `json:"id"`
-	Timestamp time.Time      `json:"timestamp"`
-	Plans     []session.Plan `json:"plans"`
+	ID        string           `json:"id"`
+	Timestamp time.Time        `json:"timestamp"`
+	Plans     []session.Plan   `json:"plans"`
 	Reports   []session.Report `json:"reports,omitempty"`
 }
 

@@ -58,11 +58,11 @@ type Model struct {
 	selected map[int]bool
 	cursor   int
 
-	filter   textinput.Model
-	target   textinput.Model
-	mode     session.Mode
-	width    int
-	height   int
+	filter textinput.Model
+	target textinput.Model
+	mode   session.Mode
+	width  int
+	height int
 
 	plans   []session.Plan
 	reports []session.Report

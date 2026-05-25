@@ -168,18 +168,35 @@ func restoreClaude(runDir string, plan session.Plan) error {
 	root := paths.ClaudeRoot()
 	encOld := encodeClaudeForUndo(plan.OldCWD)
 	encNew := encodeClaudeForUndo(plan.NewCWD)
-	// 1. Remove the migrated dir (move-mode) or just the copy (copy-mode).
-	if plan.Mode == "move" {
-		_ = os.RemoveAll(filepath.Join(root, "projects", encNew))
-	} else {
-		_ = os.RemoveAll(filepath.Join(root, "projects", encNew))
+
+	// Remove the post-migration destination dir before restoring (it was a
+	// merge of src + original dst content).
+	_ = os.RemoveAll(filepath.Join(root, "projects", encNew))
+
+	// 1. Restore destination dir's pre-existing content if we captured it.
+	dstSnap := filepath.Join(bk, "projects-dst-"+encNew)
+	if pathExists(dstSnap) {
+		dst := filepath.Join(root, "projects", encNew)
+		if err := copyTreeOrFail(dstSnap, dst); err != nil {
+			return err
+		}
 	}
-	// 2. Restore source dir.
-	src := filepath.Join(bk, "projects-"+encOld)
-	if pathExists(src) {
-		dst := filepath.Join(root, "projects", encOld)
-		_ = os.RemoveAll(dst)
-		if err := copyTreeOrFail(src, dst); err != nil {
+	// 2. Restore source dir from the BEFORE snapshot. Try the current name
+	// first, fall back to the legacy `projects-<enc>` name written by older
+	// versions of mvs.
+	srcSnap := filepath.Join(bk, "projects-src-"+encOld)
+	if !pathExists(srcSnap) {
+		legacy := filepath.Join(bk, "projects-"+encOld)
+		if pathExists(legacy) {
+			srcSnap = legacy
+		} else {
+			srcSnap = ""
+		}
+	}
+	if srcSnap != "" {
+		src := filepath.Join(root, "projects", encOld)
+		_ = os.RemoveAll(src)
+		if err := copyTreeOrFail(srcSnap, src); err != nil {
 			return err
 		}
 	}

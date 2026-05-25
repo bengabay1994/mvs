@@ -2,6 +2,7 @@ package adapter
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -228,10 +229,19 @@ func (c *Claude) Apply(plan session.Plan, opts session.ApplyOpts) session.Report
 			addErr("create backup root: %v", err)
 			return r
 		}
-		// Snapshot the source dir, history.jsonl, and .claude.json.
+		// Snapshot the source dir.
 		if paths.Exists(srcDir) {
-			if err := copyTree(srcDir, filepath.Join(bkRoot, "projects-"+encOld)); err != nil {
+			if err := copyTree(srcDir, filepath.Join(bkRoot, "projects-src-"+encOld)); err != nil {
 				addErr("backup project dir: %v", err)
+				return r
+			}
+		}
+		// Snapshot the destination dir if it already exists. Without this,
+		// undo deletes the dst dir entirely and any pre-existing sessions
+		// at the new cwd are lost.
+		if paths.Exists(dstDir) {
+			if err := copyTree(dstDir, filepath.Join(bkRoot, "projects-dst-"+encNew)); err != nil {
+				addErr("backup destination dir: %v", err)
 				return r
 			}
 		}
@@ -324,10 +334,68 @@ func (c *Claude) Apply(plan session.Plan, opts session.ApplyOpts) session.Report
 }
 
 // rewriteJSONLField rewrites a top-level string field across every line of a
-// JSONL file when its current value matches oldVal. Atomic via temp-file + rename.
-// Top-level keys may be re-ordered (we marshal a map), which is harmless for
-// Claude Code's parser.
+// JSONL file when its current value matches oldVal. Surgical: it locates the
+// exact byte span of `"field":"<json-escaped-oldVal>"` and replaces it,
+// leaving every other byte of the line (key order, whitespace, escape style)
+// untouched. This matters because claude-code is sensitive to the original
+// byte layout — a json.Marshal round-trip HTML-escapes <,>,& and sorts keys,
+// which can hide the session from /resume.
 func rewriteJSONLField(path, field, oldVal, newVal string) error {
+	return streamRewriteLines(path, func(line []byte) []byte {
+		return replaceTopLevelStringField(line, field, oldVal, newVal)
+	})
+}
+
+// replaceTopLevelStringField swaps the value of a top-level string field of a
+// JSON object on a single line, without round-tripping through map[string]any.
+// Returns the line unchanged if parsing fails, the field is missing, or the
+// current value doesn't match oldVal.
+func replaceTopLevelStringField(line []byte, field, oldVal, newVal string) []byte {
+	if len(line) == 0 {
+		return line
+	}
+	var probe map[string]json.RawMessage
+	if err := json.Unmarshal(line, &probe); err != nil {
+		return line
+	}
+	raw, ok := probe[field]
+	if !ok {
+		return line
+	}
+	var cur string
+	if err := json.Unmarshal(raw, &cur); err != nil {
+		return line
+	}
+	if cur != oldVal {
+		return line
+	}
+	oldEnc, err := json.Marshal(oldVal)
+	if err != nil {
+		return line
+	}
+	newEnc, err := json.Marshal(newVal)
+	if err != nil {
+		return line
+	}
+	// Construct `"field":"value"` byte patterns. claude-code writes compact
+	// JSON with no whitespace, so the literal bytes will match.
+	oldPat := append([]byte{'"'}, []byte(field)...)
+	oldPat = append(oldPat, '"', ':')
+	oldPat = append(oldPat, oldEnc...)
+	newPat := append([]byte{'"'}, []byte(field)...)
+	newPat = append(newPat, '"', ':')
+	newPat = append(newPat, newEnc...)
+	out := bytes.Replace(line, oldPat, newPat, 1)
+	if !bytes.Equal(out, line) || cur == newVal {
+		return out
+	}
+	return line
+}
+
+// streamRewriteLines applies a per-line transform to a JSONL/text file
+// atomically via temp-file + rename. The transform receives the line without
+// its trailing newline; the trailing newline is preserved if present.
+func streamRewriteLines(path string, transform func(line []byte) []byte) error {
 	in, err := os.Open(path)
 	if err != nil {
 		return err
@@ -339,8 +407,9 @@ func rewriteJSONLField(path, field, oldVal, newVal string) error {
 		return err
 	}
 	tmpName := tmp.Name()
+	cleanup := true
 	defer func() {
-		if tmp != nil {
+		if cleanup {
 			tmp.Close()
 			os.Remove(tmpName)
 		}
@@ -358,20 +427,84 @@ func rewriteJSONLField(path, field, oldVal, newVal string) error {
 			raw = line[:len(line)-1]
 		}
 		if len(raw) > 0 {
-			out := raw
-			var m map[string]json.RawMessage
-			if json.Unmarshal(raw, &m) == nil {
-				if cur, ok := m[field]; ok {
-					var s string
-					if json.Unmarshal(cur, &s) == nil && s == oldVal {
-						nb, _ := json.Marshal(newVal)
-						m[field] = nb
-						if b, mErr := json.Marshal(m); mErr == nil {
-							out = b
-						}
-					}
+			if _, werr := w.Write(transform(raw)); werr != nil {
+				return werr
+			}
+		}
+		if hasNewline {
+			if err := w.WriteByte('\n'); err != nil {
+				return err
+			}
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+	}
+	if err := w.Flush(); err != nil {
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if st, err := os.Stat(path); err == nil {
+		_ = os.Chmod(tmpName, st.Mode().Perm())
+	}
+	cleanup = false
+	return os.Rename(tmpName, path)
+}
+
+// rewriteHistoryJSONL updates each line's `project` field. In move mode any
+// matching line is rewritten in place via surgical byte replacement. In copy
+// mode, every matching line is also duplicated so the new cwd inherits prompt
+// history without losing the old.
+func rewriteHistoryJSONL(path, oldCWD, newCWD string, copyMode bool) error {
+	in, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".mvs-history-*.jsonl")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			tmp.Close()
+			os.Remove(tmpName)
+		}
+	}()
+
+	w := bufio.NewWriter(tmp)
+	br := bufio.NewReaderSize(in, 1<<20)
+
+	for {
+		line, err := br.ReadBytes('\n')
+		hasContent := len(line) > 0
+		hasNewline := hasContent && line[len(line)-1] == '\n'
+		raw := line
+		if hasNewline {
+			raw = line[:len(line)-1]
+		}
+		if len(raw) > 0 {
+			matched := lineHasTopLevelStringField(raw, "project", oldCWD)
+			if matched && copyMode {
+				if _, werr := w.Write(raw); werr != nil {
+					return werr
+				}
+				if err := w.WriteByte('\n'); err != nil {
+					return err
 				}
 			}
+			out := replaceTopLevelStringField(raw, "project", oldCWD, newCWD)
 			if _, werr := w.Write(out); werr != nil {
 				return werr
 			}
@@ -397,118 +530,48 @@ func rewriteJSONLField(path, field, oldVal, newVal string) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	tmp = nil
-	// Preserve perms.
 	if st, err := os.Stat(path); err == nil {
 		_ = os.Chmod(tmpName, st.Mode().Perm())
 	}
+	cleanup = false
 	return os.Rename(tmpName, path)
 }
 
-// rewriteHistoryJSONL updates each line's `project` field. In move mode any
-// matching line is rewritten; in copy mode matching lines are duplicated so the
-// new cwd inherits prompt history without losing the old.
-func rewriteHistoryJSONL(path, oldCWD, newCWD string, copyMode bool) error {
-	in, err := os.Open(path)
-	if err != nil {
-		return err
+// lineHasTopLevelStringField returns true if the JSON-line has a top-level
+// string field == want.
+func lineHasTopLevelStringField(line []byte, field, want string) bool {
+	var probe map[string]json.RawMessage
+	if err := json.Unmarshal(line, &probe); err != nil {
+		return false
 	}
-	defer in.Close()
-
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".mvs-history-*.jsonl")
-	if err != nil {
-		return err
+	raw, ok := probe[field]
+	if !ok {
+		return false
 	}
-	tmpName := tmp.Name()
-	defer func() {
-		if tmp != nil {
-			tmp.Close()
-			os.Remove(tmpName)
-		}
-	}()
-
-	w := bufio.NewWriter(tmp)
-	br := bufio.NewReaderSize(in, 1<<20)
-
-	for {
-		line, err := br.ReadBytes('\n')
-		hasContent := len(line) > 0
-		hasNewline := hasContent && line[len(line)-1] == '\n'
-		raw := line
-		if hasNewline {
-			raw = line[:len(line)-1]
-		}
-
-		if len(raw) > 0 {
-			var m map[string]json.RawMessage
-			if uerr := json.Unmarshal(raw, &m); uerr == nil {
-				if cur, ok := m["project"]; ok {
-					var s string
-					if json.Unmarshal(cur, &s) == nil && s == oldCWD {
-						if copyMode {
-							// keep original
-							if _, werr := w.Write(raw); werr != nil {
-								return werr
-							}
-							if err := w.WriteByte('\n'); err != nil {
-								return err
-							}
-						}
-						nb, _ := json.Marshal(newCWD)
-						m["project"] = nb
-						if b, mErr := json.Marshal(m); mErr == nil {
-							raw = b
-						}
-					}
-				}
-			}
-			if _, werr := w.Write(raw); werr != nil {
-				return werr
-			}
-		}
-		if hasNewline {
-			if err := w.WriteByte('\n'); err != nil {
-				return err
-			}
-		}
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return err
-		}
+	var cur string
+	if err := json.Unmarshal(raw, &cur); err != nil {
+		return false
 	}
-	if err := w.Flush(); err != nil {
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	tmp = nil
-	if st, err := os.Stat(path); err == nil {
-		_ = os.Chmod(tmpName, st.Mode().Perm())
-	}
-	return os.Rename(tmpName, path)
+	return cur == want
 }
 
 // renameClaudeJSONProjectKey loads ~/.claude.json, renames .projects[oldCWD] to
 // .projects[newCWD] (move) or duplicates it (copy), and atomically writes back.
+// HTML escaping is disabled so values containing <,>,& survive the round-trip
+// unchanged. Top-level key order isn't preserved (Go maps are unordered) but
+// .claude.json is a config file, not a content-addressed transcript.
 func renameClaudeJSONProjectKey(path, oldCWD, newCWD string, copyMode bool) error {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return err
 	}
-	// We must preserve all other top-level fields exactly. Use RawMessage map.
 	var top map[string]json.RawMessage
 	if err := json.Unmarshal(data, &top); err != nil {
 		return err
 	}
 	projRaw, ok := top["projects"]
 	if !ok {
-		return nil // nothing to do
+		return nil
 	}
 	var projs map[string]json.RawMessage
 	if err := json.Unmarshal(projRaw, &projs); err != nil {
@@ -516,22 +579,43 @@ func renameClaudeJSONProjectKey(path, oldCWD, newCWD string, copyMode bool) erro
 	}
 	old, ok := projs[oldCWD]
 	if !ok {
-		return nil // no entry to migrate; not an error
+		return nil
 	}
 	projs[newCWD] = old
 	if !copyMode {
 		delete(projs, oldCWD)
 	}
-	nb, err := json.MarshalIndent(projs, "", "  ")
+	nb, err := marshalNoHTMLEscape(projs, "  ")
 	if err != nil {
 		return err
 	}
 	top["projects"] = nb
-	out, err := json.MarshalIndent(top, "", "  ")
+	out, err := marshalNoHTMLEscape(top, "  ")
 	if err != nil {
 		return err
 	}
 	return atomicWrite(path, out)
+}
+
+// marshalNoHTMLEscape encodes v as compact-or-indented JSON without
+// HTML-escaping <,>,&. Pass "" for compact output, "  " (or similar) for
+// indented.
+func marshalNoHTMLEscape(v any, indent string) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if indent != "" {
+		enc.SetIndent("", indent)
+	}
+	if err := enc.Encode(v); err != nil {
+		return nil, err
+	}
+	out := buf.Bytes()
+	// json.Encoder always appends a trailing newline; drop it.
+	if len(out) > 0 && out[len(out)-1] == '\n' {
+		out = out[:len(out)-1]
+	}
+	return out, nil
 }
 
 func atomicWrite(path string, data []byte) error {

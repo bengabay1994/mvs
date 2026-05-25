@@ -2,6 +2,7 @@ package adapter
 
 import (
 	"bufio"
+	"bytes"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -282,86 +283,102 @@ func codexRolloutBaseWithNewID(oldBase, newID string) string {
 }
 
 // rewriteCodexRolloutCWD streams the rollout JSONL and rewrites payload.cwd on
-// session_meta + turn_context lines where the current cwd equals oldCWD.
+// session_meta + turn_context lines where the current cwd equals oldCWD. Uses
+// a surgical byte-level swap so the rest of the line (key order, nested JSON
+// formatting, <>& chars) survives unchanged — codex's threads-table backfill
+// reads field bytes more strictly than spec.
 func rewriteCodexRolloutCWD(path, oldCWD, newCWD string) error {
+	oldPat, newPat, err := jsonFieldPattern("cwd", oldCWD, newCWD)
+	if err != nil {
+		return err
+	}
 	return streamRewriteJSONL(path, func(line []byte) []byte {
-		var m map[string]json.RawMessage
-		if err := json.Unmarshal(line, &m); err != nil {
+		if !codexLineHasType(line, "session_meta", "turn_context") {
 			return line
 		}
-		typeRaw, ok := m["type"]
-		if !ok {
+		if !bytes.Contains(line, oldPat) {
 			return line
 		}
-		var t string
-		if err := json.Unmarshal(typeRaw, &t); err != nil {
-			return line
-		}
-		if t != "session_meta" && t != "turn_context" {
-			return line
-		}
-		payloadRaw, ok := m["payload"]
-		if !ok {
-			return line
-		}
-		var pm map[string]json.RawMessage
-		if err := json.Unmarshal(payloadRaw, &pm); err != nil {
-			return line
-		}
-		cwdRaw, ok := pm["cwd"]
-		if !ok {
-			return line
-		}
-		var cur string
-		if err := json.Unmarshal(cwdRaw, &cur); err != nil {
-			return line
-		}
-		if cur != oldCWD {
-			return line
-		}
-		nb, _ := json.Marshal(newCWD)
-		pm["cwd"] = nb
-		newPayload, err := json.Marshal(pm)
-		if err != nil {
-			return line
-		}
-		m["payload"] = newPayload
-		out, err := json.Marshal(m)
-		if err != nil {
-			return line
-		}
-		return out
+		return bytes.Replace(line, oldPat, newPat, 1)
 	})
 }
 
 func rewriteCodexRolloutID(path, newID string) error {
+	// We don't know the old id ahead of time, so peek line 1.
+	in, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	sc := bufio.NewScanner(in)
+	sc.Buffer(make([]byte, 1<<20), 1<<24)
+	var oldID string
+	if sc.Scan() {
+		var probe struct {
+			Type    string `json:"type"`
+			Payload struct {
+				ID string `json:"id"`
+			} `json:"payload"`
+		}
+		if json.Unmarshal(sc.Bytes(), &probe) == nil && probe.Type == "session_meta" {
+			oldID = probe.Payload.ID
+		}
+	}
+	in.Close()
+	if oldID == "" || oldID == newID {
+		return nil
+	}
+	oldPat, newPat, err := jsonFieldPattern("id", oldID, newID)
+	if err != nil {
+		return err
+	}
+	first := true
 	return streamRewriteJSONL(path, func(line []byte) []byte {
-		var m map[string]json.RawMessage
-		if err := json.Unmarshal(line, &m); err != nil {
+		if !first {
 			return line
 		}
-		t := ""
-		if raw, ok := m["type"]; ok {
-			_ = json.Unmarshal(raw, &t)
-		}
-		if t != "session_meta" {
+		first = false
+		if !codexLineHasType(line, "session_meta") {
 			return line
 		}
-		payloadRaw, ok := m["payload"]
-		if !ok {
-			return line
-		}
-		var pm map[string]json.RawMessage
-		if err := json.Unmarshal(payloadRaw, &pm); err != nil {
-			return line
-		}
-		nb, _ := json.Marshal(newID)
-		pm["id"] = nb
-		newPayload, _ := json.Marshal(pm)
-		m["payload"] = newPayload
-		out, _ := json.Marshal(m)
-		return out
+		return bytes.Replace(line, oldPat, newPat, 1)
 	})
+}
+
+// codexLineHasType returns true if the JSONL line is parseable and its
+// top-level "type" field equals any of the given values.
+func codexLineHasType(line []byte, types ...string) bool {
+	var probe struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(line, &probe); err != nil {
+		return false
+	}
+	for _, t := range types {
+		if probe.Type == t {
+			return true
+		}
+	}
+	return false
+}
+
+// jsonFieldPattern builds the `"field":"<json-escape(val)>"` byte sequences
+// for old and new values. Used for surgical byte-replace of a string field at
+// any nesting depth — JSON-string escaping guarantees the pattern can't
+// collide with content inside another string literal.
+func jsonFieldPattern(field, oldVal, newVal string) (oldPat, newPat []byte, err error) {
+	oldEnc, e := json.Marshal(oldVal)
+	if e != nil {
+		return nil, nil, e
+	}
+	newEnc, e := json.Marshal(newVal)
+	if e != nil {
+		return nil, nil, e
+	}
+	prefix := append([]byte{'"'}, []byte(field)...)
+	prefix = append(prefix, '"', ':')
+	oldPat = append(append([]byte{}, prefix...), oldEnc...)
+	newPat = append(append([]byte{}, prefix...), newEnc...)
+	return oldPat, newPat, nil
 }
 
 // streamRewriteJSONL applies a per-line transformer to a JSONL file atomically.

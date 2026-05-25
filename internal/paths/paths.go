@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 )
 
 // Home returns the user's home directory or empty string.
@@ -83,4 +84,33 @@ func MvsStateRoot() string {
 func Exists(p string) bool {
 	_, err := os.Stat(p)
 	return err == nil
+}
+
+// NormalizeCWD turns a user-supplied path into the canonical form mvs stores
+// inside session files: `~` is expanded, redundant separators are collapsed,
+// and any trailing separator is stripped.
+//
+// This matters because claude-code, codex, gemini, and opencode all filter
+// sessions by an exact-string equality match between the in-file cwd and
+// `process.cwd()` at resume time. The kernel's `process.cwd()` value never has
+// a trailing slash, so a user typing `/foo/bar/` in mvs would otherwise create
+// sessions that `--resume` from `/foo/bar` cannot see.
+//
+// Empty input returns empty (caller is expected to reject it). Root "/" is
+// preserved exactly. Tilde (`~` or `~/...`) is expanded relative to $HOME.
+func NormalizeCWD(p string) string {
+	p = strings.TrimSpace(p)
+	if p == "" {
+		return ""
+	}
+	if p == "~" || strings.HasPrefix(p, "~"+string(os.PathSeparator)) {
+		if home, err := os.UserHomeDir(); err == nil {
+			if p == "~" {
+				p = home
+			} else {
+				p = filepath.Join(home, p[2:])
+			}
+		}
+	}
+	return filepath.Clean(p)
 }

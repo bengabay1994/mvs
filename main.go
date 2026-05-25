@@ -130,7 +130,12 @@ func runMigrate(args []string) {
 		fmt.Fprintln(os.Stderr, "usage: mvs migrate [flags] FROM TO")
 		os.Exit(2)
 	}
-	from, to := rest[0], rest[1]
+	from := paths.NormalizeCWD(rest[0])
+	to := paths.NormalizeCWD(rest[1])
+	if from == "" || to == "" {
+		fmt.Fprintln(os.Stderr, "FROM and TO must be non-empty paths")
+		os.Exit(2)
+	}
 	mode := session.ModeMove
 	if *copyMode {
 		mode = session.ModeCopy

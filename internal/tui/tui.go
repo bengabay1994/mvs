@@ -18,6 +18,7 @@ import (
 
 	"github.com/bengabay1994/mvs/internal/adapter"
 	"github.com/bengabay1994/mvs/internal/backup"
+	"github.com/bengabay1994/mvs/internal/paths"
 	"github.com/bengabay1994/mvs/internal/session"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
@@ -313,11 +314,10 @@ func (m Model) handleTargetKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case "enter":
-		newCWD := strings.TrimSpace(m.target.Value())
+		newCWD := paths.NormalizeCWD(m.target.Value())
 		if newCWD == "" {
 			return m, nil
 		}
-		newCWD = expandTilde(newCWD)
 		plans, err := buildPlans(m, newCWD)
 		if err != nil {
 			m.err = err

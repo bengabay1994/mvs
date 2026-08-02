@@ -19,6 +19,7 @@ import (
 
 	"github.com/bengabay1994/mvs/internal/adapter"
 	"github.com/bengabay1994/mvs/internal/backup"
+	"github.com/bengabay1994/mvs/internal/migration"
 	"github.com/bengabay1994/mvs/internal/paths"
 	"github.com/bengabay1994/mvs/internal/session"
 	"github.com/bengabay1994/mvs/internal/tui"
@@ -42,7 +43,7 @@ global flags:
   --help                  this message
 `
 
-var version = "0.1.0"
+var version = "0.2.0"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -165,26 +166,25 @@ func runMigrate(args []string) {
 		fmt.Fprintln(os.Stderr, "no sessions match", from)
 		os.Exit(1)
 	}
+	if err := migration.Validate(planned); err != nil {
+		fmt.Fprintln(os.Stderr, "plan:", err)
+		os.Exit(1)
+	}
 	printPlans(planned)
 	if *dryRun {
 		fmt.Println("(dry run; no writes)")
 		return
 	}
 
-	runID := backup.NewRunID()
-	bkDir, err := backup.Prepare(runID, planned)
+	runID, reports, err := migration.Execute(planned)
+	printReports(reports)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "prepare backup:", err)
+		fmt.Fprintln(os.Stderr, "migrate:", err)
+		if runID != "" {
+			fmt.Fprintln(os.Stderr, "backup id:", runID)
+		}
 		os.Exit(1)
 	}
-	var reports []session.Report
-	for _, p := range planned {
-		a, _ := adapter.ByName(p.Agent)
-		r := a.Apply(p, session.ApplyOpts{BackupDir: bkDir})
-		reports = append(reports, r)
-	}
-	_ = backup.Finalize(runID, reports)
-	printReports(reports)
 	fmt.Println("backup id:", runID)
 	fmt.Println("undo with: mvs undo", runID)
 }
@@ -202,6 +202,10 @@ func runUndo(args []string) {
 				m.ID, len(m.Plans), m.Timestamp.Local().Format("2006-01-02 15:04"))
 		}
 		return
+	}
+	if len(args) != 1 {
+		fmt.Fprintln(os.Stderr, "usage: mvs undo RUN_ID")
+		os.Exit(2)
 	}
 	id := args[0]
 	if err := backup.Undo(id); err != nil {

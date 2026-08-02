@@ -17,7 +17,7 @@ import (
 	"time"
 
 	"github.com/bengabay1994/mvs/internal/adapter"
-	"github.com/bengabay1994/mvs/internal/backup"
+	"github.com/bengabay1994/mvs/internal/migration"
 	"github.com/bengabay1994/mvs/internal/paths"
 	"github.com/bengabay1994/mvs/internal/session"
 	"github.com/charmbracelet/bubbles/textinput"
@@ -173,6 +173,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.adjustScroll()
 	case scanDoneMsg:
 		m.groups = msg.groups
+		m.err = msg.err
 		m.refilter()
 		m.phase = phaseList
 		return m, nil
@@ -324,6 +325,7 @@ func (m Model) handleTargetKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.plans = plans
+		m.err = nil
 		m.phase = phaseConfirm
 		return m, nil
 	}
@@ -345,40 +347,39 @@ func (m Model) handleConfirmKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "y", "enter":
 		m.phase = phaseApplying
-		runID := backup.NewRunID()
 		plans := m.plans
 		return m, func() tea.Msg {
-			return runApply(runID, plans)
+			return runApply(plans)
 		}
 	case "m":
 		m.mode = session.ModeMove
-		m.plans, _ = buildPlans(m, m.target.Value())
+		plans, err := buildPlans(m, m.target.Value())
+		if err != nil {
+			m.err = err
+			m.phase = phaseTarget
+			return m, nil
+		}
+		m.err = nil
+		m.plans = plans
 		return m, nil
 	case "c":
 		m.mode = session.ModeCopy
-		m.plans, _ = buildPlans(m, m.target.Value())
+		plans, err := buildPlans(m, m.target.Value())
+		if err != nil {
+			m.err = err
+			m.phase = phaseTarget
+			return m, nil
+		}
+		m.err = nil
+		m.plans = plans
 		return m, nil
 	}
 	return m, nil
 }
 
-func runApply(runID string, plans []session.Plan) applyDoneMsg {
-	bkDir, err := backup.Prepare(runID, plans)
-	if err != nil {
-		return applyDoneMsg{err: err, runID: runID}
-	}
-	var reports []session.Report
-	for _, p := range plans {
-		a, err := adapter.ByName(p.Agent)
-		if err != nil {
-			reports = append(reports, session.Report{Agent: p.Agent, OK: false, Errors: []string{err.Error()}})
-			continue
-		}
-		r := a.Apply(p, session.ApplyOpts{BackupDir: bkDir})
-		reports = append(reports, r)
-	}
-	_ = backup.Finalize(runID, reports)
-	return applyDoneMsg{reports: reports, runID: runID}
+func runApply(plans []session.Plan) applyDoneMsg {
+	runID, reports, err := migration.Execute(plans)
+	return applyDoneMsg{reports: reports, runID: runID, err: err}
 }
 
 func buildPlans(m Model, newCWD string) ([]session.Plan, error) {
@@ -397,6 +398,9 @@ func buildPlans(m Model, newCWD string) ([]session.Plan, error) {
 			return nil, err
 		}
 		plans = append(plans, p)
+	}
+	if err := migration.Validate(plans); err != nil {
+		return nil, err
 	}
 	return plans, nil
 }
@@ -509,6 +513,9 @@ func (m Model) viewList() string {
 	fmt.Fprintln(&b, dimStyle.Render("filter:")+" "+m.filter.View())
 	fmt.Fprintln(&b, "")
 	if len(m.groups) == 0 {
+		if m.err != nil {
+			fmt.Fprintln(&b, errStyle.Render("scan failed: "+m.err.Error()))
+		}
 		fmt.Fprintln(&b, dimStyle.Render("no sessions found on this host."))
 		fmt.Fprintln(&b, dimStyle.Render("press q to quit."))
 		return b.String()

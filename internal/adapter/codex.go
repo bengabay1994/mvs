@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/bengabay1994/mvs/internal/fsutil"
 	"github.com/bengabay1994/mvs/internal/paths"
 	"github.com/bengabay1994/mvs/internal/session"
 	"github.com/google/uuid"
@@ -178,7 +179,7 @@ func (c *Codex) Apply(plan session.Plan, opts session.ApplyOpts) session.Report 
 
 	bkRoot := filepath.Join(opts.BackupDir, "codex")
 	if !opts.DryRun {
-		if err := os.MkdirAll(bkRoot, 0o755); err != nil {
+		if err := os.MkdirAll(bkRoot, 0o700); err != nil {
 			addErr("create backup root: %v", err)
 			return r
 		}
@@ -198,22 +199,19 @@ func (c *Codex) Apply(plan session.Plan, opts session.ApplyOpts) session.Report 
 	// Backup affected files + DB.
 	dbPath := filepath.Join(paths.CodexRoot(), "state_5.sqlite")
 	if !opts.DryRun {
-		for _, p := range rolloutPaths {
-			rel, _ := filepath.Rel(paths.CodexRoot(), p)
-			if err := copyFile(p, filepath.Join(bkRoot, rel)); err != nil {
-				addErr("backup %s: %v", p, err)
-				return r
+		if plan.Mode == session.ModeMove.String() {
+			for _, p := range rolloutPaths {
+				rel, _ := filepath.Rel(paths.CodexRoot(), p)
+				if err := copyFile(p, filepath.Join(bkRoot, rel)); err != nil {
+					addErr("backup %s: %v", p, err)
+					return r
+				}
 			}
 		}
 		if paths.Exists(dbPath) {
-			for _, suffix := range []string{"", "-wal", "-shm"} {
-				src := dbPath + suffix
-				if paths.Exists(src) {
-					if err := copyFile(src, filepath.Join(bkRoot, filepath.Base(src))); err != nil {
-						addErr("backup db: %v", err)
-						return r
-					}
-				}
+			if err := snapshotSQLite(dbPath, filepath.Join(bkRoot, filepath.Base(dbPath))); err != nil {
+				addErr("backup db: %v", err)
+				return r
 			}
 		}
 	}
@@ -235,15 +233,21 @@ func (c *Codex) Apply(plan session.Plan, opts session.ApplyOpts) session.Report 
 			if opts.DryRun {
 				continue
 			}
-			newID := uuid.NewString()
 			oldBase := filepath.Base(a.From)
-			// Replace the trailing -<uuid>.jsonl with the new id.
-			newBase := codexRolloutBaseWithNewID(oldBase, newID)
-			newPath := filepath.Join(filepath.Dir(a.From), newBase)
+			var newID, newPath string
+			for {
+				newID = uuid.NewString()
+				newBase := codexRolloutBaseWithNewID(oldBase, newID)
+				newPath = filepath.Join(filepath.Dir(a.From), newBase)
+				if !paths.Exists(newPath) {
+					break
+				}
+			}
 			if err := copyFile(a.From, newPath); err != nil {
 				addErr("copy rollout: %v", err)
 				continue
 			}
+			r.Applied = append(r.Applied, session.Action{Kind: "copy_file", From: a.From, Target: newPath, Created: true})
 			if err := rewriteCodexRolloutCWD(newPath, plan.OldCWD, plan.NewCWD); err != nil {
 				addErr("rewrite copied rollout: %v", err)
 				continue
@@ -252,7 +256,6 @@ func (c *Codex) Apply(plan session.Plan, opts session.ApplyOpts) session.Report 
 				addErr("rewrite rollout id: %v", err)
 				continue
 			}
-			r.Applied = append(r.Applied, session.Action{Kind: "copy_file", From: a.From, Target: newPath})
 			newCopies = append(newCopies, codexCopy{oldPath: a.From, newPath: newPath, newID: newID})
 		}
 	}
@@ -266,6 +269,7 @@ func (c *Codex) Apply(plan session.Plan, opts session.ApplyOpts) session.Report 
 		}
 	}
 
+	finalizeReportDigests(&r)
 	return r
 }
 
@@ -276,6 +280,12 @@ func codexRolloutBaseWithNewID(oldBase, newID string) string {
 		return oldBase + "." + newID + suffix
 	}
 	stem := strings.TrimSuffix(oldBase, suffix)
+	if len(stem) >= 36 {
+		oldID := stem[len(stem)-36:]
+		if _, err := uuid.Parse(oldID); err == nil {
+			return stem[:len(stem)-36] + newID + suffix
+		}
+	}
 	if i := strings.LastIndex(stem, "-"); i >= 0 {
 		return stem[:i+1] + newID + suffix
 	}
@@ -292,7 +302,7 @@ func rewriteCodexRolloutCWD(path, oldCWD, newCWD string) error {
 	if err != nil {
 		return err
 	}
-	return streamRewriteJSONL(path, func(line []byte) []byte {
+	if err := streamRewriteJSONL(path, func(line []byte) []byte {
 		if !codexLineHasType(line, "session_meta", "turn_context") {
 			return line
 		}
@@ -300,7 +310,10 @@ func rewriteCodexRolloutCWD(path, oldCWD, newCWD string) error {
 			return line
 		}
 		return bytes.Replace(line, oldPat, newPat, 1)
-	})
+	}); err != nil {
+		return err
+	}
+	return ensureCodexCWDAbsent(path, oldCWD)
 }
 
 func rewriteCodexRolloutID(path, newID string) error {
@@ -332,7 +345,7 @@ func rewriteCodexRolloutID(path, newID string) error {
 		return err
 	}
 	first := true
-	return streamRewriteJSONL(path, func(line []byte) []byte {
+	if err := streamRewriteJSONL(path, func(line []byte) []byte {
 		if !first {
 			return line
 		}
@@ -341,7 +354,35 @@ func rewriteCodexRolloutID(path, newID string) error {
 			return line
 		}
 		return bytes.Replace(line, oldPat, newPat, 1)
-	})
+	}); err != nil {
+		return err
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 1<<20), 1<<24)
+	if !scanner.Scan() {
+		if err := scanner.Err(); err != nil {
+			return err
+		}
+		return errors.New("copied rollout is empty")
+	}
+	var verify struct {
+		Type    string `json:"type"`
+		Payload struct {
+			ID string `json:"id"`
+		} `json:"payload"`
+	}
+	if err := json.Unmarshal(scanner.Bytes(), &verify); err != nil {
+		return err
+	}
+	if verify.Type != "session_meta" || verify.Payload.ID != newID {
+		return fmt.Errorf("copied rollout id was not rewritten to %q", newID)
+	}
+	return nil
 }
 
 // codexLineHasType returns true if the JSONL line is parseable and its
@@ -439,8 +480,37 @@ func streamRewriteJSONL(path string, transform func(line []byte) []byte) error {
 	if st, err := os.Stat(path); err == nil {
 		_ = os.Chmod(tmpName, st.Mode().Perm())
 	}
+	if err := fsutil.Replace(tmpName, path); err != nil {
+		return err
+	}
 	cleanup = false
-	return os.Rename(tmpName, path)
+	return nil
+}
+
+func ensureCodexCWDAbsent(path, oldCWD string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 1<<20), 1<<24)
+	line := 0
+	for scanner.Scan() {
+		line++
+		if !codexLineHasType(scanner.Bytes(), "session_meta", "turn_context") {
+			continue
+		}
+		var probe struct {
+			Payload struct {
+				CWD string `json:"cwd"`
+			} `json:"payload"`
+		}
+		if json.Unmarshal(scanner.Bytes(), &probe) == nil && probe.Payload.CWD == oldCWD {
+			return fmt.Errorf("line %d still contains payload.cwd=%q after rewrite", line, oldCWD)
+		}
+	}
+	return scanner.Err()
 }
 
 type codexCopy struct {
@@ -467,8 +537,16 @@ func codexUpdateDB(dbPath string, plan session.Plan, oldPaths []string, copies [
 		}
 		defer stmt.Close()
 		for _, p := range oldPaths {
-			if _, err := stmt.Exec(plan.NewCWD, p); err != nil {
+			result, err := stmt.Exec(plan.NewCWD, p)
+			if err != nil {
 				return err
+			}
+			updated, err := result.RowsAffected()
+			if err != nil {
+				return err
+			}
+			if updated == 0 {
+				return fmt.Errorf("no Codex thread row matched rollout %s", p)
 			}
 		}
 	} else {
@@ -481,9 +559,6 @@ func codexUpdateDB(dbPath string, plan session.Plan, oldPaths []string, copies [
 				createdAt, updatedAt                      int64
 			)
 			if err := row.Scan(&oldID, &oldRP, &createdAt, &updatedAt, &src, &mp, &cwd, &title, &sp, &am); err != nil {
-				if errors.Is(err, sql.ErrNoRows) {
-					continue
-				}
 				return err
 			}
 			_ = oldID

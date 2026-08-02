@@ -120,3 +120,34 @@ func TestJSONFieldPattern(t *testing.T) {
 		t.Errorf("escaped newPat = %q, want %q", newPat, want)
 	}
 }
+
+func TestCodexRolloutBaseWithNewIDReplacesFullUUID(t *testing.T) {
+	old := "rollout-2026-07-30T12-34-56-550e8400-e29b-41d4-a716-446655440000.jsonl"
+	newID := "7c9e6679-7425-40de-944b-e07fc1f90ae7"
+	want := "rollout-2026-07-30T12-34-56-" + newID + ".jsonl"
+	if got := codexRolloutBaseWithNewID(old, newID); got != want {
+		t.Fatalf("codexRolloutBaseWithNewID() = %q, want %q", got, want)
+	}
+}
+
+func TestRewriteJSONLFieldRejectsUnchangedMatchingField(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	// The generated formats are compact. If that invariant changes, mvs must
+	// fail rather than silently claim that a matching cwd was rewritten.
+	if err := os.WriteFile(path, []byte(`{"cwd" : "/old/path"}`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := rewriteJSONLField(path, "cwd", "/old/path", "/new/path"); err == nil {
+		t.Fatal("unchanged matching cwd was not detected")
+	}
+}
+
+func TestRewriteHistoryRejectsUnchangedFormattedProject(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "history.jsonl")
+	if err := os.WriteFile(path, []byte(`{"project" : "/old/path"}`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := rewriteHistoryJSONL(path, "/old/path", "/new/path", false); err == nil {
+		t.Fatal("unchanged matching history project was not detected")
+	}
+}

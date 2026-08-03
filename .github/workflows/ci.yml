@@ -22,5 +22,48 @@ jobs:
       - run: mise exec -- go test ./...
       - run: mise exec -- go vet ./...
       - run: mise exec -- go build -trimpath .
+      - if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          .\install.ps1 -Prefix "$env:RUNNER_TEMP\mvs-install-pwsh"
+          & "$env:RUNNER_TEMP\mvs-install-pwsh\bin\mvs.exe" --version
+      - if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey("Environment", $true)
+          $hadPath = $key.GetValueNames() -contains "Path"
+          if ($hadPath) {
+            $originalPath = $key.GetValue("Path", "", [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+            $originalKind = $key.GetValueKind("Path")
+          }
+          try {
+            $key.SetValue("Path", '%USERPROFILE%\existing-bin', [Microsoft.Win32.RegistryValueKind]::ExpandString)
+            $key.Dispose()
+
+            .\install.ps1 -Prefix "$env:RUNNER_TEMP\mvs-install-powershell" -AddToPath
+            & "$env:RUNNER_TEMP\mvs-install-powershell\bin\mvs.exe" --version
+
+            $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey("Environment")
+            $updatedPath = $key.GetValue("Path", "", [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+            if (-not $updatedPath.Contains('%USERPROFILE%\existing-bin')) {
+              throw "Installer expanded an existing user PATH entry: $updatedPath"
+            }
+            if (-not $updatedPath.Contains("$env:RUNNER_TEMP\mvs-install-powershell\bin")) {
+              throw "Installer did not persist its installation directory: $updatedPath"
+            }
+            if ($key.GetValueKind("Path") -ne [Microsoft.Win32.RegistryValueKind]::ExpandString) {
+              throw "Installer changed the user PATH registry value kind."
+            }
+          }
+          finally {
+            if ($key) { $key.Dispose() }
+            $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey("Environment", $true)
+            if ($hadPath) {
+              $key.SetValue("Path", $originalPath, $originalKind)
+            } else {
+              $key.DeleteValue("Path", $false)
+            }
+            $key.Dispose()
+          }
       - if: runner.os != 'Windows'
         run: mise exec -- go test -race ./...

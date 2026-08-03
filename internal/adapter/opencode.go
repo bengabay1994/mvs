@@ -42,7 +42,11 @@ func (o *OpenCode) Discover() ([]session.Session, error) {
 	if !paths.Exists(dbPath) {
 		return nil, nil
 	}
-	db, err := sql.Open("sqlite", "file:"+dbPath+"?mode=ro&_pragma=busy_timeout(5000)")
+	dsn, err := sqliteDSN(dbPath, "ro", "busy_timeout(5000)")
+	if err != nil {
+		return nil, err
+	}
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
 	}
@@ -190,7 +194,11 @@ func (o *OpenCode) Apply(plan session.Plan, opts session.ApplyOpts) session.Repo
 // in copy mode, it duplicates session rows (and their messages/parts) with new
 // IDs so both old and new cwd carry the history.
 func opencodeUpdateDB(dbPath string, plan session.Plan) error {
-	db, err := sql.Open("sqlite", "file:"+dbPath+"?_pragma=busy_timeout(5000)&_pragma=foreign_keys(off)")
+	dsn, err := sqliteDSN(dbPath, "", "busy_timeout(5000)", "foreign_keys(off)")
+	if err != nil {
+		return err
+	}
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return err
 	}
@@ -479,7 +487,7 @@ func hasTable(tx *sql.Tx, name string) bool {
 }
 
 func tableColumns(tx *sql.Tx, name string) ([]string, error) {
-	rows, err := tx.Query(`PRAGMA table_info(` + name + `)`)
+	rows, err := tx.Query(`PRAGMA table_info(` + quoteSQLiteIdentifier(name) + `)`)
 	if err != nil {
 		return nil, err
 	}
@@ -499,6 +507,9 @@ func tableColumns(tx *sql.Tx, name string) ([]string, error) {
 		}
 		cols = append(cols, cname)
 	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
 	return cols, nil
 }
 
@@ -515,12 +526,16 @@ func cloneRowsRemap(tx *sql.Tx, table, idCol string, idMap map[string]string,
 		return err
 	}
 	if len(cols) == 0 {
-		return nil
+		return fmt.Errorf("table %s has no writable columns", table)
 	}
-	colList := strings.Join(cols, ",")
+	quotedCols := make([]string, len(cols))
+	for i, column := range cols {
+		quotedCols[i] = quoteSQLiteIdentifier(column)
+	}
+	colList := strings.Join(quotedCols, ",")
 	placeholders := strings.Repeat("?,", len(cols))
 	placeholders = strings.TrimRight(placeholders, ",")
-	insertStmt, err := tx.Prepare(fmt.Sprintf(`INSERT INTO %s (%s) VALUES (%s)`, table, colList, placeholders))
+	insertStmt, err := tx.Prepare(fmt.Sprintf(`INSERT INTO %s (%s) VALUES (%s)`, quoteSQLiteIdentifier(table), colList, placeholders))
 	if err != nil {
 		return err
 	}
@@ -530,11 +545,12 @@ func cloneRowsRemap(tx *sql.Tx, table, idCol string, idMap map[string]string,
 	for k := range idMap {
 		oldIDs = append(oldIDs, k)
 	}
-	rows, err := tx.Query(fmt.Sprintf(`SELECT %s FROM %s WHERE %s IN (%s)`, colList, table, idCol, inClause(oldIDs)), toAny(oldIDs)...)
+	rows, err := tx.Query(fmt.Sprintf(`SELECT %s FROM %s WHERE %s IN (%s)`, colList, quoteSQLiteIdentifier(table), quoteSQLiteIdentifier(idCol), inClause(oldIDs)), toAny(oldIDs)...)
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
+	inserted := 0
 	for rows.Next() {
 		vals := make([]any, len(cols))
 		ptrs := make([]any, len(cols))
@@ -568,8 +584,19 @@ func cloneRowsRemap(tx *sql.Tx, table, idCol string, idMap map[string]string,
 		if _, err := insertStmt.Exec(vals...); err != nil {
 			return err
 		}
+		inserted++
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if inserted != len(idMap) {
+		return fmt.Errorf("cloned %d %s row(s), want %d", inserted, table, len(idMap))
 	}
 	return nil
+}
+
+func quoteSQLiteIdentifier(value string) string {
+	return `"` + strings.ReplaceAll(value, `"`, `""`) + `"`
 }
 
 func autoIDMap(tx *sql.Tx, table, col string, val string, prefix string) map[string]string {

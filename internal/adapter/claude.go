@@ -10,6 +10,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 
 	"github.com/bengabay1994/mvs/internal/fsutil"
@@ -160,6 +161,11 @@ func (c *Claude) Plan(sessions []session.Session, opts session.PlanOpts) (sessio
 		}
 	}
 	newCWD := opts.NewCWD
+	if paths.Exists(paths.ClaudeJSON()) {
+		if err := validateClaudeProjectMetadataTarget(paths.ClaudeJSON(), oldCWD, newCWD); err != nil {
+			return session.Plan{}, err
+		}
+	}
 	encOld := encodeClaude(oldCWD)
 	encNew := encodeClaude(newCWD)
 	root := paths.ClaudeRoot()
@@ -611,7 +617,15 @@ func renameClaudeJSONProjectKey(path, oldCWD, newCWD string, copyMode bool) erro
 	if !ok {
 		return nil
 	}
-	if _, targetExists := projs[newCWD]; !targetExists {
+	if target, targetExists := projs[newCWD]; targetExists {
+		equal, err := jsonRawEqual(old, target)
+		if err != nil {
+			return err
+		}
+		if !equal {
+			return fmt.Errorf("Claude project metadata already exists for %q and differs from %q", newCWD, oldCWD)
+		}
+	} else {
 		projs[newCWD] = old
 	}
 	if !copyMode {
@@ -627,6 +641,47 @@ func renameClaudeJSONProjectKey(path, oldCWD, newCWD string, copyMode bool) erro
 		return err
 	}
 	return atomicWrite(path, out)
+}
+
+func validateClaudeProjectMetadataTarget(path, oldCWD, newCWD string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	var top struct {
+		Projects map[string]json.RawMessage `json:"projects"`
+	}
+	if err := json.Unmarshal(data, &top); err != nil {
+		return err
+	}
+	old, oldExists := top.Projects[oldCWD]
+	target, targetExists := top.Projects[newCWD]
+	if !oldExists || !targetExists {
+		return nil
+	}
+	equal, err := jsonRawEqual(old, target)
+	if err != nil {
+		return err
+	}
+	if !equal {
+		return fmt.Errorf("Claude project metadata already exists for %q and differs from %q", newCWD, oldCWD)
+	}
+	return nil
+}
+
+func jsonRawEqual(left, right json.RawMessage) (bool, error) {
+	var leftValue, rightValue any
+	leftDecoder := json.NewDecoder(bytes.NewReader(left))
+	leftDecoder.UseNumber()
+	if err := leftDecoder.Decode(&leftValue); err != nil {
+		return false, err
+	}
+	rightDecoder := json.NewDecoder(bytes.NewReader(right))
+	rightDecoder.UseNumber()
+	if err := rightDecoder.Decode(&rightValue); err != nil {
+		return false, err
+	}
+	return reflect.DeepEqual(leftValue, rightValue), nil
 }
 
 // marshalNoHTMLEscape encodes v as compact-or-indented JSON without

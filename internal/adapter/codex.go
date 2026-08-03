@@ -523,7 +523,11 @@ type codexCopy struct {
 
 // codexUpdateDB applies threads.cwd / rollout_path edits in a single tx.
 func codexUpdateDB(dbPath string, plan session.Plan, oldPaths []string, copies []codexCopy) error {
-	db, err := sql.Open("sqlite", "file:"+dbPath+"?_pragma=busy_timeout(5000)&_pragma=foreign_keys(on)")
+	dsn, err := sqliteDSN(dbPath, "", "busy_timeout(5000)", "foreign_keys(on)")
+	if err != nil {
+		return err
+	}
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return err
 	}
@@ -554,22 +558,18 @@ func codexUpdateDB(dbPath string, plan session.Plan, oldPaths []string, copies [
 			}
 		}
 	} else {
-		// Copy mode: INSERT new threads rows mirroring the old, with new id, cwd, path.
-		// We replicate the row exactly except for those three fields.
+		// Copy mode: clone every current schema column and override only the
+		// identity, location, and update timestamp fields.
 		for _, c := range copies {
-			row := tx.QueryRow("SELECT id, rollout_path, created_at, updated_at, source, model_provider, cwd, title, sandbox_policy, approval_mode FROM threads WHERE rollout_path = ?", c.oldPath)
-			var (
-				oldID, oldRP, src, mp, cwd, title, sp, am string
-				createdAt, updatedAt                      int64
-			)
-			if err := row.Scan(&oldID, &oldRP, &createdAt, &updatedAt, &src, &mp, &cwd, &title, &sp, &am); err != nil {
+			var oldID string
+			if err := tx.QueryRow("SELECT id FROM threads WHERE rollout_path = ?", c.oldPath).Scan(&oldID); err != nil {
 				return err
 			}
-			_ = oldID
-			_, err := tx.Exec(`INSERT INTO threads (id, rollout_path, created_at, updated_at, source, model_provider, cwd, title, sandbox_policy, approval_mode)
-                               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-				c.newID, c.newPath, createdAt, time.Now().UnixMilli(), src, mp, plan.NewCWD, title, sp, am)
-			if err != nil {
+			if err := cloneRowsRemap(tx, "threads", "id", map[string]string{oldID: c.newID}, map[string]any{
+				"rollout_path": c.newPath,
+				"updated_at":   time.Now().UnixMilli(),
+				"cwd":          plan.NewCWD,
+			}, nil); err != nil {
 				return err
 			}
 		}

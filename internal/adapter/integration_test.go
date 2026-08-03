@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -29,7 +30,6 @@ func TestClaudeMovePreservesSessionsInLossyDirectoryAndUndoes(t *testing.T) {
 	mustWriteJSONLine(t, filepath.Join(paths.ClaudeRoot(), "history.jsonl"), map[string]any{"project": oldCWD, "display": "hello"})
 	mustWriteJSONFile(t, paths.ClaudeJSON(), map[string]any{"projects": map[string]any{
 		oldCWD: map[string]string{"allowed": "old"},
-		newCWD: map[string]string{"allowed": "target"},
 	}})
 
 	a := &Claude{}
@@ -63,8 +63,8 @@ func TestClaudeMovePreservesSessionsInLossyDirectoryAndUndoes(t *testing.T) {
 		Projects map[string]map[string]string `json:"projects"`
 	}
 	readJSONFile(t, paths.ClaudeJSON(), &claudeConfig)
-	if claudeConfig.Projects[newCWD]["allowed"] != "target" {
-		t.Fatal("pre-existing destination Claude config was overwritten")
+	if claudeConfig.Projects[newCWD]["allowed"] != "old" {
+		t.Fatal("source Claude config was not transferred")
 	}
 	if _, exists := claudeConfig.Projects[oldCWD]; exists {
 		t.Fatal("old Claude config key still exists after move")
@@ -98,6 +98,39 @@ func TestClaudeMovePreservesSessionsInLossyDirectoryAndUndoes(t *testing.T) {
 	}
 }
 
+func TestClaudePlanRejectsConflictingProjectMetadata(t *testing.T) {
+	configureTestHome(t)
+	workspace := t.TempDir()
+	oldCWD := filepath.Join(workspace, "old")
+	newCWD := filepath.Join(workspace, "new")
+	source := filepath.Join(paths.ClaudeRoot(), "projects", encodeClaude(oldCWD), "session.jsonl")
+	mustWriteJSONLine(t, source, map[string]any{"cwd": oldCWD, "type": "user"})
+	mustWriteJSONFile(t, paths.ClaudeJSON(), map[string]any{"projects": map[string]any{
+		oldCWD: map[string]string{"permission": "source"},
+		newCWD: map[string]string{"permission": "target"},
+	}})
+
+	a := &Claude{}
+	_, err := a.Plan([]session.Session{{Agent: "claude", ID: "session", CWD: oldCWD, Path: source}}, session.PlanOpts{
+		NewCWD: newCWD,
+		Mode:   session.ModeMove,
+	})
+	if err == nil || !strings.Contains(err.Error(), "metadata already exists") {
+		t.Fatalf("Plan() error = %v, want metadata collision", err)
+	}
+	if err := renameClaudeJSONProjectKey(paths.ClaudeJSON(), oldCWD, newCWD, false); err == nil {
+		t.Fatal("apply-time metadata collision was not rejected")
+	}
+
+	var config struct {
+		Projects map[string]map[string]string `json:"projects"`
+	}
+	readJSONFile(t, paths.ClaudeJSON(), &config)
+	if config.Projects[oldCWD]["permission"] != "source" || config.Projects[newCWD]["permission"] != "target" {
+		t.Fatal("metadata collision changed Claude config")
+	}
+}
+
 func TestCodexCopyCreatesValidRolloutAndUndoRemovesIt(t *testing.T) {
 	configureTestHome(t)
 	workspace := t.TempDir()
@@ -113,9 +146,14 @@ func TestCodexCopyCreatesValidRolloutAndUndoRemovesIt(t *testing.T) {
 	db := openTestDB(t, dbPath)
 	mustExec(t, db, `CREATE TABLE threads (
 		id TEXT PRIMARY KEY, rollout_path TEXT, created_at INTEGER, updated_at INTEGER,
-		source TEXT, model_provider TEXT, cwd TEXT, title TEXT, sandbox_policy TEXT, approval_mode TEXT
+		source TEXT, model_provider TEXT, cwd TEXT, title TEXT, sandbox_policy TEXT, approval_mode TEXT,
+		tokens_used INTEGER, has_user_event INTEGER, archived INTEGER, archived_at INTEGER,
+		git_sha TEXT, git_branch TEXT, git_origin_url TEXT, metadata_json TEXT
 	)`)
-	mustExec(t, db, `INSERT INTO threads VALUES (?, ?, 1, 1, 'cli', 'openai', ?, 'title', 'workspace-write', 'ask')`, oldID, rollout, oldCWD)
+	mustExec(t, db, `INSERT INTO threads VALUES (
+		?, ?, 1, 1, 'cli', 'openai', ?, 'title', 'workspace-write', 'ask',
+		4321, 1, 1, 9876, 'abc123', 'feature/test', 'https://example.com/repo.git', '{"team":"security"}'
+	)`, oldID, rollout, oldCWD)
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -156,11 +194,23 @@ func TestCodexCopyCreatesValidRolloutAndUndoRemovesIt(t *testing.T) {
 	if err := db.QueryRow(`SELECT COUNT(*) FROM threads WHERE cwd = ?`, newCWD).Scan(&targetRows); err != nil {
 		t.Fatal(err)
 	}
+	var tokensUsed, hasUserEvent, archived, archivedAt int64
+	var gitSHA, gitBranch, gitOrigin, metadataJSON string
+	if err := db.QueryRow(`SELECT tokens_used, has_user_event, archived, archived_at, git_sha, git_branch, git_origin_url, metadata_json
+		FROM threads WHERE cwd = ?`, newCWD).Scan(
+		&tokensUsed, &hasUserEvent, &archived, &archivedAt, &gitSHA, &gitBranch, &gitOrigin, &metadataJSON,
+	); err != nil {
+		t.Fatal(err)
+	}
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
 	if targetRows != 1 {
 		t.Fatalf("got %d copied thread rows, want 1", targetRows)
+	}
+	if tokensUsed != 4321 || hasUserEvent != 1 || archived != 1 || archivedAt != 9876 ||
+		gitSHA != "abc123" || gitBranch != "feature/test" || gitOrigin != "https://example.com/repo.git" || metadataJSON != `{"team":"security"}` {
+		t.Fatal("copied Codex thread did not preserve extended schema fields")
 	}
 	sourceMarker := `{"type":"event_msg","payload":{"text":"source changed after copy"}}` + "\n"
 	sourceData, err := os.ReadFile(rollout)
@@ -198,7 +248,10 @@ func TestGeminiMoveUpdatesRegistryWithoutMovingSlugStoreAndUndoes(t *testing.T) 
 	mustWriteJSONFile(t, projectsPath, map[string]any{"version": 7, "projects": map[string]string{geminiNormalize(oldCWD): id}})
 	chat := filepath.Join(paths.GeminiRoot(), "tmp", id, "chats", "chat.jsonl")
 	mustWriteJSONLine(t, chat, map[string]any{"projectHash": sha256Hex(oldCWD), "directories": []string{oldCWD}})
-	mustWriteFile(t, filepath.Join(paths.GeminiRoot(), "tmp", id, ".project_root"), geminiNormalize(oldCWD)+"\n")
+	tmpMarker := filepath.Join(paths.GeminiRoot(), "tmp", id, ".project_root")
+	historyMarker := filepath.Join(paths.GeminiRoot(), "history", id, ".project_root")
+	mustWriteFile(t, tmpMarker, geminiNormalize(oldCWD)+"\n")
+	mustWriteFile(t, historyMarker, geminiNormalize(oldCWD)+"\n")
 
 	a := &Gemini{}
 	plan, err := a.Plan([]session.Session{{Agent: "gemini", ID: id, CWD: oldCWD, Path: chat}}, session.PlanOpts{
@@ -229,7 +282,8 @@ func TestGeminiMoveUpdatesRegistryWithoutMovingSlugStoreAndUndoes(t *testing.T) 
 		t.Fatal("unknown projects.json fields were discarded")
 	}
 	assertFileContains(t, chat, sha256Hex(newCWD))
-	assertFileContains(t, filepath.Join(paths.GeminiRoot(), "tmp", id, ".project_root"), geminiNormalize(newCWD))
+	assertFileContains(t, tmpMarker, geminiNormalize(newCWD))
+	assertFileContains(t, historyMarker, geminiNormalize(newCWD))
 	postMigrationChat := filepath.Join(paths.GeminiRoot(), "tmp", id, "chats", "new-chat.jsonl")
 	mustWriteJSONLine(t, postMigrationChat, map[string]any{"projectHash": sha256Hex(newCWD)})
 	if err := backup.Undo(runID); err == nil || !strings.Contains(err.Error(), "refusing undo") {
@@ -253,6 +307,8 @@ func TestGeminiMoveUpdatesRegistryWithoutMovingSlugStoreAndUndoes(t *testing.T) 
 		t.Fatal("Gemini registry was not restored")
 	}
 	assertFileContains(t, chat, sha256Hex(oldCWD))
+	assertFileContains(t, tmpMarker, geminiNormalize(oldCWD))
+	assertFileContains(t, historyMarker, geminiNormalize(oldCWD))
 }
 
 func TestGeminiUndoRemovesMetadataCreatedByMove(t *testing.T) {
@@ -306,6 +362,10 @@ func TestGeminiCopyUndoDoesNotOverwriteActiveSource(t *testing.T) {
 	mustWriteJSONFile(t, filepath.Join(paths.GeminiRoot(), "projects.json"), map[string]any{"projects": map[string]string{geminiNormalize(oldCWD): id}})
 	chat := filepath.Join(paths.GeminiRoot(), "tmp", id, "chats", "chat.jsonl")
 	mustWriteJSONLine(t, chat, map[string]any{"projectHash": sha256Hex(oldCWD), "directories": []string{oldCWD}})
+	sourceTmpMarker := filepath.Join(paths.GeminiRoot(), "tmp", id, ".project_root")
+	sourceHistoryMarker := filepath.Join(paths.GeminiRoot(), "history", id, ".project_root")
+	mustWriteFile(t, sourceTmpMarker, geminiNormalize(oldCWD)+"\n")
+	mustWriteFile(t, sourceHistoryMarker, geminiNormalize(oldCWD)+"\n")
 
 	a := &Gemini{}
 	plan, err := a.Plan([]session.Session{{Agent: "gemini", ID: id, CWD: oldCWD, Path: chat}}, session.PlanOpts{
@@ -319,11 +379,20 @@ func TestGeminiCopyUndoDoesNotOverwriteActiveSource(t *testing.T) {
 	if !report.OK {
 		t.Fatalf("apply failed: %v", report.Errors)
 	}
+	registry, err := readGeminiProjects()
+	if err != nil {
+		t.Fatal(err)
+	}
+	newID := registry[geminiNormalize(newCWD)]
+	assertFileContains(t, filepath.Join(paths.GeminiRoot(), "tmp", newID, ".project_root"), geminiNormalize(newCWD))
+	assertFileContains(t, filepath.Join(paths.GeminiRoot(), "history", newID, ".project_root"), geminiNormalize(newCWD))
 	mustWriteJSONLine(t, chat, map[string]any{"projectHash": sha256Hex(oldCWD), "sourceChanged": true})
 	if err := backup.Undo(runID); err != nil {
 		t.Fatal(err)
 	}
 	assertFileContains(t, chat, `"sourceChanged":true`)
+	assertFileContains(t, sourceTmpMarker, geminiNormalize(oldCWD))
+	assertFileContains(t, sourceHistoryMarker, geminiNormalize(oldCWD))
 }
 
 func TestOpenCodeMovePreservesRelativePathAndHistoricalDataAndUndoes(t *testing.T) {
@@ -443,12 +512,18 @@ func TestOpenCodeMovePreservesRelativePathAndHistoricalDataAndUndoes(t *testing.
 func configureTestHome(t *testing.T) string {
 	t.Helper()
 	home := t.TempDir()
+	dataDirName := "share #%"
+	codexDirName := ".codex #%"
+	if runtime.GOOS != "windows" {
+		dataDirName += " ?"
+		codexDirName += " ?"
+	}
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)
-	t.Setenv("XDG_DATA_HOME", filepath.Join(home, ".local", "share"))
+	t.Setenv("XDG_DATA_HOME", filepath.Join(home, ".local", dataDirName))
 	t.Setenv("XDG_STATE_HOME", filepath.Join(home, ".local", "state"))
 	t.Setenv("CLAUDE_CONFIG_DIR", "")
-	t.Setenv("CODEX_HOME", "")
+	t.Setenv("CODEX_HOME", filepath.Join(home, codexDirName))
 	return home
 }
 
@@ -532,7 +607,11 @@ func openTestDB(t *testing.T, path string) *sql.DB {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	db, err := sql.Open("sqlite", path)
+	dsn, err := sqliteDSN(path, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		t.Fatal(err)
 	}

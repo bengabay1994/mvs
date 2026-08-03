@@ -228,11 +228,13 @@ func (g *Gemini) Plan(sessions []session.Session, opts session.PlanOpts) (sessio
 			Detail: sub + "/" + oldID + " → " + sub + "/" + newID,
 		})
 	}
-	plan.Actions = append(plan.Actions,
-		session.Action{Kind: "write_file", Target: filepath.Join(paths.GeminiRoot(), "tmp", newID, ".project_root"), Detail: "set canonical cwd"},
-		session.Action{Kind: "write_file", Target: filepath.Join(paths.GeminiRoot(), "projects.json"), Detail: "update registry"},
-		session.Action{Kind: "write_file", Target: filepath.Join(paths.GeminiRoot(), "tmp", newID, "chats"), Detail: "rewrite projectHash in chat headers + path prefixes"},
-	)
+	for _, sub := range []string{"tmp", "history"} {
+		plan.Actions = append(plan.Actions,
+			session.Action{Kind: "write_file", Target: filepath.Join(paths.GeminiRoot(), sub, newID, ".project_root"), Detail: "set canonical cwd"},
+			session.Action{Kind: "write_file", Target: filepath.Join(paths.GeminiRoot(), sub, newID, "chats"), Detail: "rewrite projectHash in chat headers + path prefixes"},
+		)
+	}
+	plan.Actions = append(plan.Actions, session.Action{Kind: "write_file", Target: filepath.Join(paths.GeminiRoot(), "projects.json"), Detail: "update registry"})
 	return plan, nil
 }
 
@@ -376,15 +378,17 @@ func (g *Gemini) Apply(plan session.Plan, opts session.ApplyOpts) session.Report
 		}
 	}
 
-	// 2. Update .project_root in the new tmp/ dir.
+	// 2. Update the ownership marker in every migrated store.
 	if !opts.DryRun {
-		pr := filepath.Join(paths.GeminiRoot(), "tmp", newID, ".project_root")
-		if paths.Exists(filepath.Dir(pr)) {
-			created := !paths.Exists(pr)
-			if err := atomicWrite(pr, []byte(geminiNormalize(plan.NewCWD)+"\n")); err != nil {
-				addErr("write .project_root: %v", err)
-			} else {
-				r.Applied = append(r.Applied, session.Action{Kind: "write_file", Target: pr, Created: created})
+		for _, sub := range []string{"tmp", "history"} {
+			pr := filepath.Join(paths.GeminiRoot(), sub, newID, ".project_root")
+			if paths.Exists(filepath.Dir(pr)) {
+				created := !paths.Exists(pr)
+				if err := atomicWrite(pr, []byte(geminiNormalize(plan.NewCWD)+"\n")); err != nil {
+					addErr("write %s .project_root: %v", sub, err)
+				} else {
+					r.Applied = append(r.Applied, session.Action{Kind: "write_file", Target: pr, Created: created})
+				}
 			}
 		}
 	}

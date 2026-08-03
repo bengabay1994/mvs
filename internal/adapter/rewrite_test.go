@@ -2,6 +2,7 @@ package adapter
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -149,5 +150,18 @@ func TestRewriteHistoryRejectsUnchangedFormattedProject(t *testing.T) {
 	}
 	if err := rewriteHistoryJSONL(path, "/old/path", "/new/path", false); err == nil {
 		t.Fatal("unchanged matching history project was not detected")
+	}
+}
+
+func TestJSONRawEqualPreservesLargeIntegerPrecision(t *testing.T) {
+	equal, err := jsonRawEqual(
+		json.RawMessage(`{"counter":9007199254740992}`),
+		json.RawMessage(`{"counter":9007199254740993}`),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if equal {
+		t.Fatal("distinct large integers compared equal")
 	}
 }

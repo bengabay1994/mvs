@@ -86,9 +86,9 @@ func Exists(p string) bool {
 	return err == nil
 }
 
-// NormalizeCWD turns a user-supplied path into the canonical form mvs stores
-// inside session files: `~` is expanded, redundant separators are collapsed,
-// and any trailing separator is stripped.
+// NormalizeCWD turns a user-supplied path into the canonical absolute form mvs
+// stores inside session files: `~` is expanded, relative paths are resolved,
+// redundant separators are collapsed, and trailing separators are stripped.
 //
 // This matters because claude-code, codex, gemini, and opencode all filter
 // sessions by an exact-string equality match between the in-file cwd and
@@ -112,5 +112,10 @@ func NormalizeCWD(p string) string {
 			}
 		}
 	}
-	return filepath.Clean(p)
+	p = filepath.Clean(p)
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return p
+	}
+	return filepath.Clean(abs)
 }

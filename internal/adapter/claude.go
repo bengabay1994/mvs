@@ -10,8 +10,10 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 
+	"github.com/bengabay1994/mvs/internal/fsutil"
 	"github.com/bengabay1994/mvs/internal/paths"
 	"github.com/bengabay1994/mvs/internal/session"
 )
@@ -159,10 +161,14 @@ func (c *Claude) Plan(sessions []session.Session, opts session.PlanOpts) (sessio
 		}
 	}
 	newCWD := opts.NewCWD
+	if paths.Exists(paths.ClaudeJSON()) {
+		if err := validateClaudeProjectMetadataTarget(paths.ClaudeJSON(), oldCWD, newCWD); err != nil {
+			return session.Plan{}, err
+		}
+	}
 	encOld := encodeClaude(oldCWD)
 	encNew := encodeClaude(newCWD)
 	root := paths.ClaudeRoot()
-	srcDir := filepath.Join(root, "projects", encOld)
 	dstDir := filepath.Join(root, "projects", encNew)
 
 	plan := session.Plan{
@@ -171,26 +177,23 @@ func (c *Claude) Plan(sessions []session.Session, opts session.PlanOpts) (sessio
 		NewCWD: newCWD,
 		Mode:   opts.Mode.String(),
 	}
-	if opts.Mode == session.ModeMove {
-		plan.Actions = append(plan.Actions, session.Action{
-			Kind:   "rename_dir",
-			From:   srcDir,
-			Target: dstDir,
-			Detail: fmt.Sprintf("rename projects/%s → projects/%s", encOld, encNew),
-		})
-	} else {
-		plan.Actions = append(plan.Actions, session.Action{
-			Kind:   "copy_dir",
-			From:   srcDir,
-			Target: dstDir,
-			Detail: fmt.Sprintf("copy projects/%s → projects/%s", encOld, encNew),
-		})
+	if opts.Mode == session.ModeCopy && encOld == encNew {
+		return session.Plan{}, fmt.Errorf("cannot copy Claude sessions because %q and %q share the same encoded storage directory", oldCWD, newCWD)
 	}
 	for _, s := range sessions {
+		target := filepath.Join(dstDir, s.ID+".jsonl")
+		if s.Path != target && paths.Exists(target) {
+			return session.Plan{}, fmt.Errorf("Claude destination session already exists: %s", target)
+		}
+		kind := "move_file"
+		if opts.Mode == session.ModeCopy {
+			kind = "copy_file"
+		}
 		plan.Actions = append(plan.Actions, session.Action{
-			Kind:   "write_file",
-			Target: filepath.Join(dstDir, s.ID+".jsonl"),
-			Detail: "rewrite top-level cwd in every line",
+			Kind:   kind,
+			From:   s.Path,
+			Target: target,
+			Detail: "place transcript and rewrite top-level cwd",
 		})
 	}
 	plan.Actions = append(plan.Actions,
@@ -225,23 +228,14 @@ func (c *Claude) Apply(plan session.Plan, opts session.ApplyOpts) session.Report
 
 	bkRoot := filepath.Join(opts.BackupDir, "claude")
 	if !opts.DryRun {
-		if err := os.MkdirAll(bkRoot, 0o755); err != nil {
+		if err := os.MkdirAll(bkRoot, 0o700); err != nil {
 			addErr("create backup root: %v", err)
 			return r
 		}
-		// Snapshot the source dir.
-		if paths.Exists(srcDir) {
+		// Move mode changes source transcripts; copy mode leaves them intact.
+		if plan.Mode == session.ModeMove.String() && paths.Exists(srcDir) {
 			if err := copyTree(srcDir, filepath.Join(bkRoot, "projects-src-"+encOld)); err != nil {
 				addErr("backup project dir: %v", err)
-				return r
-			}
-		}
-		// Snapshot the destination dir if it already exists. Without this,
-		// undo deletes the dst dir entirely and any pre-existing sessions
-		// at the new cwd are lost.
-		if paths.Exists(dstDir) {
-			if err := copyTree(dstDir, filepath.Join(bkRoot, "projects-dst-"+encNew)); err != nil {
-				addErr("backup destination dir: %v", err)
 				return r
 			}
 		}
@@ -259,57 +253,67 @@ func (c *Claude) Apply(plan session.Plan, opts session.ApplyOpts) session.Report
 		}
 	}
 
-	// 1. Place files at the destination.
+	// 1. Place only the selected transcripts at the destination. Claude's
+	// encoded directory can contain unrelated cwds because its encoding is
+	// lossy, so moving the whole directory is unsafe.
 	if !paths.Exists(srcDir) {
 		addErr("source dir missing: %s", srcDir)
 		return r
 	}
 	if !opts.DryRun {
-		if err := os.MkdirAll(filepath.Dir(dstDir), 0o755); err != nil {
+		if err := os.MkdirAll(dstDir, 0o755); err != nil {
 			addErr("mkdir parent: %v", err)
 			return r
 		}
-		if plan.Mode == "move" {
-			if err := os.Rename(srcDir, dstDir); err != nil {
-				if err := copyTree(srcDir, dstDir); err != nil {
-					addErr("place files (copy fallback): %v", err)
-					return r
-				}
-				if err := os.RemoveAll(srcDir); err != nil {
-					addErr("remove src after copy fallback: %v", err)
-				}
+	}
+	for _, action := range plan.Actions {
+		if action.Kind != "move_file" && action.Kind != "copy_file" {
+			continue
+		}
+		if opts.DryRun {
+			continue
+		}
+		created := action.From != action.Target
+		recorded := false
+		if created {
+			if paths.Exists(action.Target) {
+				addErr("destination session already exists: %s", action.Target)
+				continue
 			}
+			if action.Kind == "move_file" {
+				if err := os.Rename(action.From, action.Target); err != nil {
+					if err := copyFile(action.From, action.Target); err != nil {
+						addErr("move %s: %v", action.From, err)
+						continue
+					}
+					r.Applied = append(r.Applied, session.Action{
+						Kind: action.Kind, From: action.From, Target: action.Target, Created: true,
+					})
+					recorded = true
+					if err := os.Remove(action.From); err != nil {
+						addErr("remove source %s: %v", action.From, err)
+						continue
+					}
+				}
+			} else if err := copyFile(action.From, action.Target); err != nil {
+				addErr("copy %s: %v", action.From, err)
+				continue
+			}
+		}
+		if !recorded {
+			r.Applied = append(r.Applied, session.Action{
+				Kind: action.Kind, From: action.From, Target: action.Target, Created: created,
+			})
+		}
+		if err := rewriteJSONLField(action.Target, "cwd", plan.OldCWD, plan.NewCWD); err != nil {
+			addErr("rewrite %s: %v", action.Target, err)
 		} else {
-			if err := copyTree(srcDir, dstDir); err != nil {
-				addErr("copy dir: %v", err)
-				return r
-			}
+			r.Applied = append(r.Applied, session.Action{Kind: "write_file", Target: action.Target})
 		}
 	}
-	r.Applied = append(r.Applied, session.Action{
-		Kind:   plan.Mode + "_dir",
-		From:   srcDir,
-		Target: dstDir,
-	})
-
-	// 2. Rewrite top-level cwd in every JSONL under dstDir.
-	if !opts.DryRun {
-		entries, err := os.ReadDir(dstDir)
-		if err != nil {
-			addErr("read dst dir: %v", err)
-		} else {
-			for _, e := range entries {
-				if e.IsDir() || !strings.HasSuffix(e.Name(), ".jsonl") {
-					continue
-				}
-				p := filepath.Join(dstDir, e.Name())
-				if err := rewriteJSONLField(p, "cwd", plan.OldCWD, plan.NewCWD); err != nil {
-					addErr("rewrite %s: %v", p, err)
-				} else {
-					r.Applied = append(r.Applied, session.Action{Kind: "write_file", Target: p})
-				}
-			}
-		}
+	if plan.Mode == "move" && srcDir != dstDir {
+		// Remove the source directory only when no unrelated entries remain.
+		_ = os.Remove(srcDir)
 	}
 
 	// 3. history.jsonl — rewrite the `project` field on matching lines.
@@ -330,6 +334,7 @@ func (c *Claude) Apply(plan session.Plan, opts session.ApplyOpts) session.Report
 		}
 	}
 
+	finalizeReportDigests(&r)
 	return r
 }
 
@@ -341,9 +346,12 @@ func (c *Claude) Apply(plan session.Plan, opts session.ApplyOpts) session.Report
 // byte layout — a json.Marshal round-trip HTML-escapes <,>,& and sorts keys,
 // which can hide the session from /resume.
 func rewriteJSONLField(path, field, oldVal, newVal string) error {
-	return streamRewriteLines(path, func(line []byte) []byte {
+	if err := streamRewriteLines(path, func(line []byte) []byte {
 		return replaceTopLevelStringField(line, field, oldVal, newVal)
-	})
+	}); err != nil {
+		return err
+	}
+	return ensureJSONLFieldAbsent(path, field, oldVal)
 }
 
 // replaceTopLevelStringField swaps the value of a top-level string field of a
@@ -452,11 +460,18 @@ func streamRewriteLines(path string, transform func(line []byte) []byte) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
+	// Windows cannot replace a destination while it is still open.
+	if err := in.Close(); err != nil {
+		return err
+	}
 	if st, err := os.Stat(path); err == nil {
 		_ = os.Chmod(tmpName, st.Mode().Perm())
 	}
+	if err := fsutil.Replace(tmpName, path); err != nil {
+		return err
+	}
 	cleanup = false
-	return os.Rename(tmpName, path)
+	return nil
 }
 
 // rewriteHistoryJSONL updates each line's `project` field. In move mode any
@@ -530,11 +545,32 @@ func rewriteHistoryJSONL(path, oldCWD, newCWD string, copyMode bool) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
+	// Windows cannot replace a destination while it is still open.
+	if err := in.Close(); err != nil {
+		return err
+	}
 	if st, err := os.Stat(path); err == nil {
 		_ = os.Chmod(tmpName, st.Mode().Perm())
 	}
+	if err := fsutil.Replace(tmpName, path); err != nil {
+		return err
+	}
 	cleanup = false
-	return os.Rename(tmpName, path)
+	if !copyMode {
+		return ensureJSONLFieldAbsent(path, "project", oldCWD)
+	}
+	oldCount, err := countJSONLField(path, "project", oldCWD)
+	if err != nil {
+		return err
+	}
+	newCount, err := countJSONLField(path, "project", newCWD)
+	if err != nil {
+		return err
+	}
+	if oldCount > 0 && newCount < oldCount {
+		return fmt.Errorf("copied history contains %d old project entries but only %d target entries", oldCount, newCount)
+	}
+	return nil
 }
 
 // lineHasTopLevelStringField returns true if the JSON-line has a top-level
@@ -581,7 +617,17 @@ func renameClaudeJSONProjectKey(path, oldCWD, newCWD string, copyMode bool) erro
 	if !ok {
 		return nil
 	}
-	projs[newCWD] = old
+	if target, targetExists := projs[newCWD]; targetExists {
+		equal, err := jsonRawEqual(old, target)
+		if err != nil {
+			return err
+		}
+		if !equal {
+			return fmt.Errorf("Claude project metadata already exists for %q and differs from %q", newCWD, oldCWD)
+		}
+	} else {
+		projs[newCWD] = old
+	}
 	if !copyMode {
 		delete(projs, oldCWD)
 	}
@@ -595,6 +641,47 @@ func renameClaudeJSONProjectKey(path, oldCWD, newCWD string, copyMode bool) erro
 		return err
 	}
 	return atomicWrite(path, out)
+}
+
+func validateClaudeProjectMetadataTarget(path, oldCWD, newCWD string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	var top struct {
+		Projects map[string]json.RawMessage `json:"projects"`
+	}
+	if err := json.Unmarshal(data, &top); err != nil {
+		return err
+	}
+	old, oldExists := top.Projects[oldCWD]
+	target, targetExists := top.Projects[newCWD]
+	if !oldExists || !targetExists {
+		return nil
+	}
+	equal, err := jsonRawEqual(old, target)
+	if err != nil {
+		return err
+	}
+	if !equal {
+		return fmt.Errorf("Claude project metadata already exists for %q and differs from %q", newCWD, oldCWD)
+	}
+	return nil
+}
+
+func jsonRawEqual(left, right json.RawMessage) (bool, error) {
+	var leftValue, rightValue any
+	leftDecoder := json.NewDecoder(bytes.NewReader(left))
+	leftDecoder.UseNumber()
+	if err := leftDecoder.Decode(&leftValue); err != nil {
+		return false, err
+	}
+	rightDecoder := json.NewDecoder(bytes.NewReader(right))
+	rightDecoder.UseNumber()
+	if err := rightDecoder.Decode(&rightValue); err != nil {
+		return false, err
+	}
+	return reflect.DeepEqual(leftValue, rightValue), nil
 }
 
 // marshalNoHTMLEscape encodes v as compact-or-indented JSON without
@@ -643,7 +730,7 @@ func atomicWrite(path string, data []byte) error {
 	if st, err := os.Stat(path); err == nil {
 		_ = os.Chmod(tmpName, st.Mode().Perm())
 	}
-	if err := os.Rename(tmpName, path); err != nil {
+	if err := fsutil.Replace(tmpName, path); err != nil {
 		return err
 	}
 	cleanup = false
@@ -660,18 +747,65 @@ func copyFile(src, dst string) error {
 		return err
 	}
 	defer in.Close()
-	out, err := os.Create(dst)
+	out, err := os.CreateTemp(filepath.Dir(dst), ".mvs-copy-*.tmp")
 	if err != nil {
 		return err
 	}
-	defer out.Close()
+	tmpName := out.Name()
+	cleanup := true
+	defer func() {
+		_ = out.Close()
+		if cleanup {
+			_ = os.Remove(tmpName)
+		}
+	}()
 	if _, err := io.Copy(out, in); err != nil {
 		return err
 	}
 	if st, err := os.Stat(src); err == nil {
-		_ = os.Chmod(dst, st.Mode().Perm())
+		if err := out.Chmod(st.Mode().Perm()); err != nil {
+			return err
+		}
+	}
+	if err := out.Sync(); err != nil {
+		return err
+	}
+	if err := out.Close(); err != nil {
+		return err
+	}
+	if err := fsutil.Replace(tmpName, dst); err != nil {
+		return err
+	}
+	cleanup = false
+	return nil
+}
+
+func ensureJSONLFieldAbsent(path, field, oldVal string) error {
+	count, err := countJSONLField(path, field, oldVal)
+	if err != nil {
+		return err
+	}
+	if count > 0 {
+		return fmt.Errorf("file still contains %d line(s) with %s=%q after rewrite", count, field, oldVal)
 	}
 	return nil
+}
+
+func countJSONLField(path, field, value string) (int, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 1<<20), 1<<24)
+	count := 0
+	for scanner.Scan() {
+		if lineHasTopLevelStringField(scanner.Bytes(), field, value) {
+			count++
+		}
+	}
+	return count, scanner.Err()
 }
 
 // copyTree recursively copies a directory tree, preserving timestamps best-effort.

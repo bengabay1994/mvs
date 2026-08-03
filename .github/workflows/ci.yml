@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: jdx/mise-action@v4
+      - run: mise exec -- go test ./...
+      - run: mise exec -- go vet ./...
+      - run: mise exec -- go build -trimpath .
+      - if: runner.os != 'Windows'
+        run: mise exec -- go test -race ./...

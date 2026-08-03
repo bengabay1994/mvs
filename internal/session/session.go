@@ -50,6 +50,8 @@ type Action struct {
 	Target  string `json:"target"`         // primary path or db URI
 	From    string `json:"from,omitempty"` // for renames/copies
 	Detail  string `json:"detail,omitempty"`
+	Created bool   `json:"created,omitempty"` // target did not exist before this action
+	Digest  string `json:"digest,omitempty"`  // post-apply content fingerprint for safe undo
 	SQL     string `json:"sql,omitempty"`
 	SQLArgs []any  `json:"sql_args,omitempty"`
 }

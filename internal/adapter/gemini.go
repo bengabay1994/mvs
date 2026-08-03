@@ -1,6 +1,7 @@
 package adapter
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
@@ -87,7 +88,7 @@ func readGeminiProjects() (map[string]string, error) {
 		Projects map[string]string `json:"projects"`
 	}
 	if err := json.Unmarshal(data, &wrap); err != nil {
-		return map[string]string{}, nil
+		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
 	if wrap.Projects == nil {
 		wrap.Projects = map[string]string{}
@@ -109,7 +110,10 @@ func (g *Gemini) Discover() ([]session.Session, error) {
 	if !paths.Exists(root) {
 		return nil, nil
 	}
-	registry, _ := readGeminiProjects()
+	registry, err := readGeminiProjects()
+	if err != nil {
+		return nil, err
+	}
 	// invert: id -> cwd
 	idToCWD := map[string]string{}
 	for cwd, slug := range registry {
@@ -195,18 +199,23 @@ func (g *Gemini) Plan(sessions []session.Session, opts session.PlanOpts) (sessio
 		NewCWD: opts.NewCWD,
 		Mode:   opts.Mode.String(),
 	}
-	registry, _ := readGeminiProjects()
+	registry, err := readGeminiProjects()
+	if err != nil {
+		return session.Plan{}, err
+	}
 	oldID := resolveGeminiID(oldCWD, registry)
-	// For the destination, prefer slug if registry uses slugs, else stick with sha256.
-	newID := sha256Hex(opts.NewCWD)
-	if isSlugID(oldID) {
-		newID = geminiSlug(filepath.Base(opts.NewCWD))
+	newID, err := geminiDestinationID(oldID, opts.NewCWD, registry, opts.Mode)
+	if err != nil {
+		return session.Plan{}, err
 	}
 	for _, sub := range []string{"tmp", "history"} {
 		src := filepath.Join(paths.GeminiRoot(), sub, oldID)
 		dst := filepath.Join(paths.GeminiRoot(), sub, newID)
 		if !paths.Exists(src) {
 			continue
+		}
+		if src != dst && paths.Exists(dst) {
+			return session.Plan{}, fmt.Errorf("Gemini destination storage already exists: %s; migrate before opening Gemini in the target folder", dst)
 		}
 		kind := "rename_dir"
 		if opts.Mode == session.ModeCopy {
@@ -219,11 +228,13 @@ func (g *Gemini) Plan(sessions []session.Session, opts session.PlanOpts) (sessio
 			Detail: sub + "/" + oldID + " → " + sub + "/" + newID,
 		})
 	}
-	plan.Actions = append(plan.Actions,
-		session.Action{Kind: "write_file", Target: filepath.Join(paths.GeminiRoot(), "tmp", newID, ".project_root"), Detail: "set canonical cwd"},
-		session.Action{Kind: "write_file", Target: filepath.Join(paths.GeminiRoot(), "projects.json"), Detail: "update registry"},
-		session.Action{Kind: "write_file", Target: filepath.Join(paths.GeminiRoot(), "tmp", newID, "chats"), Detail: "rewrite projectHash in chat headers + path prefixes"},
-	)
+	for _, sub := range []string{"tmp", "history"} {
+		plan.Actions = append(plan.Actions,
+			session.Action{Kind: "write_file", Target: filepath.Join(paths.GeminiRoot(), sub, newID, ".project_root"), Detail: "set canonical cwd"},
+			session.Action{Kind: "write_file", Target: filepath.Join(paths.GeminiRoot(), sub, newID, "chats"), Detail: "rewrite projectHash in chat headers + path prefixes"},
+		)
+	}
+	plan.Actions = append(plan.Actions, session.Action{Kind: "write_file", Target: filepath.Join(paths.GeminiRoot(), "projects.json"), Detail: "update registry"})
 	return plan, nil
 }
 
@@ -240,6 +251,37 @@ func isSlugID(id string) bool {
 	return false
 }
 
+func geminiDestinationID(oldID, newCWD string, registry map[string]string, mode session.Mode) (string, error) {
+	newKey := geminiNormalize(newCWD)
+	if existing, ok := registry[newKey]; ok {
+		if mode == session.ModeCopy || existing != oldID {
+			return "", fmt.Errorf("Gemini target path is already registered as project %q; refusing to merge project stores", existing)
+		}
+		return existing, nil
+	}
+	if !isSlugID(oldID) {
+		return sha256Hex(newCWD), nil
+	}
+	if mode == session.ModeMove {
+		// Slugs are registry values, not hashes. Keeping the existing value
+		// avoids an unnecessary directory rename and basename collisions.
+		return oldID, nil
+	}
+
+	used := make(map[string]struct{}, len(registry))
+	for _, id := range registry {
+		used[id] = struct{}{}
+	}
+	base := geminiSlug(filepath.Base(newCWD))
+	candidate := base
+	for n := 2; ; n++ {
+		if _, exists := used[candidate]; !exists {
+			return candidate, nil
+		}
+		candidate = fmt.Sprintf("%s-%d", base, n)
+	}
+}
+
 func (g *Gemini) Apply(plan session.Plan, opts session.ApplyOpts) session.Report {
 	r := session.Report{Agent: g.Name(), OK: true}
 	addErr := func(format string, args ...any) {
@@ -247,16 +289,25 @@ func (g *Gemini) Apply(plan session.Plan, opts session.ApplyOpts) session.Report
 		r.Errors = append(r.Errors, fmt.Sprintf(format, args...))
 	}
 
-	registry, _ := readGeminiProjects()
+	registry, err := readGeminiProjects()
+	if err != nil {
+		addErr("read projects.json: %v", err)
+		return r
+	}
 	oldID := resolveGeminiID(plan.OldCWD, registry)
-	newID := sha256Hex(plan.NewCWD)
-	if isSlugID(oldID) {
-		newID = geminiSlug(filepath.Base(plan.NewCWD))
+	mode := session.ModeMove
+	if plan.Mode == session.ModeCopy.String() {
+		mode = session.ModeCopy
+	}
+	newID, err := geminiDestinationID(oldID, plan.NewCWD, registry, mode)
+	if err != nil {
+		addErr("resolve destination: %v", err)
+		return r
 	}
 
 	bkRoot := filepath.Join(opts.BackupDir, "gemini")
 	if !opts.DryRun {
-		if err := os.MkdirAll(bkRoot, 0o755); err != nil {
+		if err := os.MkdirAll(bkRoot, 0o700); err != nil {
 			addErr("create backup root: %v", err)
 			return r
 		}
@@ -288,35 +339,56 @@ func (g *Gemini) Apply(plan session.Plan, opts session.ApplyOpts) session.Report
 		if opts.DryRun {
 			continue
 		}
+		created := src != dst
+		if created && paths.Exists(dst) {
+			addErr("destination storage already exists: %s", dst)
+			continue
+		}
 		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 			addErr("mkdir %s: %v", filepath.Dir(dst), err)
+			continue
+		}
+		if !created {
+			r.Applied = append(r.Applied, session.Action{Kind: "write_dir", Target: dst})
 			continue
 		}
 		if plan.Mode == "move" {
 			if err := os.Rename(src, dst); err != nil {
 				if err := copyTree(src, dst); err != nil {
+					_ = os.RemoveAll(dst)
 					addErr("move %s → %s: %v", src, dst, err)
 					continue
 				}
-				_ = os.RemoveAll(src)
+				r.Applied = append(r.Applied, session.Action{Kind: "move_dir", From: src, Target: dst, Created: true})
+				if err := os.RemoveAll(src); err != nil {
+					addErr("remove source %s: %v", src, err)
+					continue
+				}
 			}
 		} else {
 			if err := copyTree(src, dst); err != nil {
+				_ = os.RemoveAll(dst)
 				addErr("copy %s → %s: %v", src, dst, err)
 				continue
 			}
 		}
-		r.Applied = append(r.Applied, session.Action{Kind: plan.Mode + "_dir", From: src, Target: dst})
+		alreadyRecorded := len(r.Applied) > 0 && r.Applied[len(r.Applied)-1].Target == dst
+		if !alreadyRecorded {
+			r.Applied = append(r.Applied, session.Action{Kind: plan.Mode + "_dir", From: src, Target: dst, Created: true})
+		}
 	}
 
-	// 2. Update .project_root in the new tmp/ dir.
+	// 2. Update the ownership marker in every migrated store.
 	if !opts.DryRun {
-		pr := filepath.Join(paths.GeminiRoot(), "tmp", newID, ".project_root")
-		if paths.Exists(filepath.Dir(pr)) {
-			if err := atomicWrite(pr, []byte(geminiNormalize(plan.NewCWD)+"\n")); err != nil {
-				addErr("write .project_root: %v", err)
-			} else {
-				r.Applied = append(r.Applied, session.Action{Kind: "write_file", Target: pr})
+		for _, sub := range []string{"tmp", "history"} {
+			pr := filepath.Join(paths.GeminiRoot(), sub, newID, ".project_root")
+			if paths.Exists(filepath.Dir(pr)) {
+				created := !paths.Exists(pr)
+				if err := atomicWrite(pr, []byte(geminiNormalize(plan.NewCWD)+"\n")); err != nil {
+					addErr("write %s .project_root: %v", sub, err)
+				} else {
+					r.Applied = append(r.Applied, session.Action{Kind: "write_file", Target: pr, Created: created})
+				}
 			}
 		}
 	}
@@ -341,50 +413,31 @@ func (g *Gemini) Apply(plan session.Plan, opts session.ApplyOpts) session.Report
 				p := filepath.Join(chatsDir, e.Name())
 				if err := rewriteGeminiChatHeader(p, oldHash, newHash, plan.OldCWD, plan.NewCWD); err != nil {
 					addErr("rewrite %s: %v", p, err)
+				} else {
+					r.Applied = append(r.Applied, session.Action{Kind: "write_file", Target: p})
 				}
 			}
 		}
 	}
 
-	// 4. Best-effort cwd-prefix rewrite across noisy files.
+	// 4. Update projects.json.
 	if !opts.DryRun {
-		for _, sub := range []string{"tmp", "history"} {
-			root := filepath.Join(paths.GeminiRoot(), sub, newID)
-			if !paths.Exists(root) {
-				continue
-			}
-			_ = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
-				if err != nil || d.IsDir() {
-					return nil
-				}
-				name := d.Name()
-				switch {
-				case name == "logs.json",
-					name == "shell_history",
-					strings.HasPrefix(name, "checkpoint-"),
-					strings.HasSuffix(name, ".json"):
-					_ = replaceInFile(p, plan.OldCWD, plan.NewCWD)
-				}
-				return nil
-			})
-		}
-	}
-
-	// 5. Update projects.json.
-	if !opts.DryRun {
+		projectsPath := filepath.Join(paths.GeminiRoot(), "projects.json")
+		created := !paths.Exists(projectsPath)
 		if err := updateGeminiProjectsJSON(plan.OldCWD, plan.NewCWD, newID, plan.Mode == "copy"); err != nil {
 			addErr("update projects.json: %v", err)
 		} else {
-			r.Applied = append(r.Applied, session.Action{Kind: "write_file", Target: filepath.Join(paths.GeminiRoot(), "projects.json")})
+			r.Applied = append(r.Applied, session.Action{Kind: "write_file", Target: projectsPath, Created: created})
 		}
 	}
 
+	finalizeReportDigests(&r)
 	return r
 }
 
 func rewriteGeminiChatHeader(path, oldHash, newHash, oldCWD, newCWD string) error {
 	first := true
-	return streamRewriteJSONL(path, func(line []byte) []byte {
+	if err := streamRewriteJSONL(path, func(line []byte) []byte {
 		if !first {
 			return line
 		}
@@ -435,42 +488,72 @@ func rewriteGeminiChatHeader(path, oldHash, newHash, oldCWD, newCWD string) erro
 			}
 		}
 		return line
-	})
+	}); err != nil {
+		return err
+	}
+	return validateGeminiChatHeader(path, oldHash, oldCWD)
 }
 
-func replaceInFile(path, oldStr, newStr string) error {
-	data, err := os.ReadFile(path)
+func validateGeminiChatHeader(path, oldHash, oldCWD string) error {
+	f, err := os.Open(path)
 	if err != nil {
 		return err
 	}
-	if !strings.Contains(string(data), oldStr) {
-		return nil
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 1<<20), 1<<24)
+	if !scanner.Scan() {
+		if err := scanner.Err(); err != nil {
+			return err
+		}
+		return errors.New("Gemini chat file is empty")
 	}
-	out := strings.ReplaceAll(string(data), oldStr, newStr)
-	return atomicWrite(path, []byte(out))
+	var header struct {
+		ProjectHash string   `json:"projectHash"`
+		Directories []string `json:"directories"`
+	}
+	if err := json.Unmarshal(scanner.Bytes(), &header); err != nil {
+		return fmt.Errorf("parse rewritten chat header: %w", err)
+	}
+	if header.ProjectHash == oldHash {
+		return errors.New("chat header still contains the old projectHash after rewrite")
+	}
+	for _, directory := range header.Directories {
+		if directory == oldCWD || strings.HasPrefix(directory, oldCWD+string(os.PathSeparator)) {
+			return fmt.Errorf("chat header still contains old directory %q after rewrite", directory)
+		}
+	}
+	return nil
 }
 
 func updateGeminiProjectsJSON(oldCWD, newCWD, newSlug string, copyMode bool) error {
 	path := filepath.Join(paths.GeminiRoot(), "projects.json")
-	registry, err := readGeminiProjects()
-	if err != nil {
+	top := map[string]json.RawMessage{}
+	if data, err := os.ReadFile(path); err == nil {
+		if err := json.Unmarshal(data, &top); err != nil {
+			return fmt.Errorf("parse %s: %w", path, err)
+		}
+	} else if !errors.Is(err, fs.ErrNotExist) {
 		return err
+	}
+	registry := map[string]string{}
+	if raw, ok := top["projects"]; ok {
+		if err := json.Unmarshal(raw, &registry); err != nil {
+			return fmt.Errorf("parse projects registry: %w", err)
+		}
 	}
 	oldKey := geminiNormalize(oldCWD)
 	newKey := geminiNormalize(newCWD)
-	if v, ok := registry[oldKey]; ok {
-		registry[newKey] = v
-		if !copyMode {
-			delete(registry, oldKey)
-		}
-	} else {
-		// No prior entry: claim a fresh one.
-		registry[newKey] = newSlug
+	registry[newKey] = newSlug
+	if !copyMode {
+		delete(registry, oldKey)
 	}
-	wrap := struct {
-		Projects map[string]string `json:"projects"`
-	}{Projects: registry}
-	out, err := marshalNoHTMLEscape(wrap, "  ")
+	projectsJSON, err := marshalNoHTMLEscape(registry, "  ")
+	if err != nil {
+		return err
+	}
+	top["projects"] = projectsJSON
+	out, err := marshalNoHTMLEscape(top, "  ")
 	if err != nil {
 		return err
 	}

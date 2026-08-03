@@ -3,6 +3,7 @@ package backup
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -86,15 +87,19 @@ func TestPrepareCreatesPrivateBackupAndManifest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := info.Mode().Perm(); got != 0o700 {
-		t.Fatalf("backup dir mode = %o, want 700", got)
+	if runtime.GOOS != "windows" {
+		if got := info.Mode().Perm(); got != 0o700 {
+			t.Fatalf("backup dir mode = %o, want 700", got)
+		}
 	}
 	manifestInfo, err := os.Stat(filepath.Join(dir, "undo.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := manifestInfo.Mode().Perm(); got != 0o600 {
-		t.Fatalf("manifest mode = %o, want 600", got)
+	if runtime.GOOS != "windows" {
+		if got := manifestInfo.Mode().Perm(); got != 0o600 {
+			t.Fatalf("manifest mode = %o, want 600", got)
+		}
 	}
 	if _, err := Prepare(id, nil); err == nil {
 		t.Fatal("duplicate backup id unexpectedly reused")

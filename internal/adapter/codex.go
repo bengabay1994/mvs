@@ -477,6 +477,10 @@ func streamRewriteJSONL(path string, transform func(line []byte) []byte) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
+	// Windows cannot replace a destination while it is still open.
+	if err := in.Close(); err != nil {
+		return err
+	}
 	if st, err := os.Stat(path); err == nil {
 		_ = os.Chmod(tmpName, st.Mode().Perm())
 	}

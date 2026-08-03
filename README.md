@@ -40,7 +40,7 @@ mise install
 .\install.ps1       # builds and copies to $HOME\.local\bin\mvs.exe
 ```
 
-If the installation directory is not on `PATH`, the script prints PowerShell commands that add it permanently to the current user's `PATH`. It does not silently modify the user's environment.
+If the installation directory is not on `PATH`, the script prints a command that adds it permanently to the current user's `PATH`. Pass `-AddToPath` to perform that opt-in update during installation. The script preserves expandable entries already present in the user's `PATH`.
 
 ### Prebuilt binaries
 
@@ -52,7 +52,7 @@ If the installation directory is not on `PATH`, the script prints PowerShell com
 - darwin/arm64
 - windows/amd64
 
-Drop one into `~/.local/bin` (Unix), or `$HOME\.local\bin` on Windows, and ensure that directory is on `PATH`. No runtime dependencies; SQLite is statically linked via `modernc.org/sqlite`.
+Drop one into `~/.local/bin` on Unix. On Windows, rename the downloaded artifact to `$HOME\.local\bin\mvs.exe`. Ensure the applicable directory is on `PATH`. No runtime dependencies; SQLite is statically linked via `modernc.org/sqlite`.
 
 ## Usage
 

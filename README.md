@@ -15,7 +15,9 @@ Supported agents:
 
 ## Install
 
-### From source (macOS/Linux with Go 1.26, pinned by `mise.toml`)
+### From source (Go 1.26, pinned by `mise.toml`)
+
+macOS/Linux:
 
 ```
 git clone https://github.com/bengabay1994/mvs
@@ -29,7 +31,16 @@ If `~/.local/bin` is not on your `PATH`, add this to your shell profile:
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-On Windows, run `mise install`, then `mise exec -- go build -o mvs.exe .` and place `mvs.exe` on `%PATH%`.
+Windows PowerShell:
+
+```powershell
+git clone https://github.com/bengabay1994/mvs
+Set-Location mvs
+mise install
+.\install.ps1       # builds and copies to $HOME\.local\bin\mvs.exe
+```
+
+If the installation directory is not on `PATH`, the script prints PowerShell commands that add it permanently to the current user's `PATH`. It does not silently modify the user's environment.
 
 ### Prebuilt binaries
 
@@ -41,7 +52,7 @@ On Windows, run `mise install`, then `mise exec -- go build -o mvs.exe .` and pl
 - darwin/arm64
 - windows/amd64
 
-Drop one into `~/.local/bin` (Unix) or anywhere on `%PATH%` (Windows) and you're done. No runtime dependencies; SQLite is statically linked via `modernc.org/sqlite`.
+Drop one into `~/.local/bin` (Unix), or `$HOME\.local\bin` on Windows, and ensure that directory is on `PATH`. No runtime dependencies; SQLite is statically linked via `modernc.org/sqlite`.
 
 ## Usage
 

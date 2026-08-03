@@ -22,5 +22,10 @@ jobs:
       - run: mise exec -- go test ./...
       - run: mise exec -- go vet ./...
       - run: mise exec -- go build -trimpath .
+      - if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          .\install.ps1 -Prefix "$env:RUNNER_TEMP\mvs-install"
+          & "$env:RUNNER_TEMP\mvs-install\bin\mvs.exe" --version
       - if: runner.os != 'Windows'
         run: mise exec -- go test -race ./...

@@ -73,8 +73,14 @@ func TestExecuteRollsBackEarlierAdaptersWhenLaterAdapterFails(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(data), oldCWD) {
-		t.Fatalf("source transcript was not restored: %s", data)
+	var restored struct {
+		CWD string `json:"cwd"`
+	}
+	if err := json.Unmarshal(data, &restored); err != nil {
+		t.Fatal(err)
+	}
+	if restored.CWD != oldCWD {
+		t.Fatalf("source transcript cwd = %q, want %q", restored.CWD, oldCWD)
 	}
 	dstTranscript := filepath.Join(paths.ClaudeRoot(), "projects", encodeClaudeForTest(newCWD), "session-1.jsonl")
 	if _, err := os.Stat(dstTranscript); !os.IsNotExist(err) {

@@ -4,8 +4,8 @@
 //
 //	scan → list (fuzzy filter + multi-select) → target path → confirm → apply
 //
-// The TUI groups sessions by (agent, cwd). Each group is the migration unit;
-// selecting it moves every session that shared that cwd.
+// Individual sessions are the default selection unit. Tab switches to projects,
+// where each row contains every session sharing an agent and cwd.
 package tui
 
 import (
@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/bengabay1994/mvs/internal/adapter"
 	"github.com/bengabay1994/mvs/internal/migration"
@@ -26,20 +27,50 @@ import (
 	"github.com/sahilm/fuzzy"
 )
 
-// Group is one (agent, cwd) bucket displayed as a single TUI row.
+// Group is a selectable row: one session, or a whole (agent, cwd) project.
 type Group struct {
 	Agent    string
 	CWD      string
 	Sessions []session.Session
 	Latest   time.Time
 	Bytes    int64
+	Scope    session.Scope
 }
 
-func (g Group) FilterValue() string { return g.Agent + " " + g.CWD }
-func (g Group) Title() string       { return fmt.Sprintf("[%s] %s", g.Agent, g.CWD) }
+func (g Group) FilterValue() string {
+	var value strings.Builder
+	value.WriteString(g.Agent + " " + g.CWD)
+	for _, s := range g.Sessions {
+		value.WriteString(" " + s.Title + " " + s.ID)
+	}
+	return value.String()
+}
+func (g Group) Title() string {
+	if g.Scope == session.ScopeSession && len(g.Sessions) == 1 {
+		s := g.Sessions[0]
+		title := displayText(s.Title)
+		if title == "" {
+			title = s.ID
+		}
+		return fmt.Sprintf("[%s] %s", g.Agent, title)
+	}
+	return fmt.Sprintf("[%s] %s", g.Agent, g.CWD)
+}
 func (g Group) Description() string {
+	if g.Scope == session.ScopeSession && len(g.Sessions) == 1 {
+		return fmt.Sprintf("%s · %s · last %s", g.Sessions[0].ID, g.CWD, humanRelTime(g.Latest))
+	}
 	return fmt.Sprintf("%d session(s) · %s · last %s",
 		len(g.Sessions), humanBytes(g.Bytes), humanRelTime(g.Latest))
+}
+
+func displayText(text string) string {
+	return strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return -1
+		}
+		return r
+	}, strings.Join(strings.Fields(text), " "))
 }
 
 type phase int
@@ -54,7 +85,9 @@ const (
 )
 
 type Model struct {
-	phase phase
+	phase    phase
+	sessions []session.Session
+	scope    session.Scope
 
 	groups   []Group
 	visible  []int // indices into groups, current filter
@@ -81,7 +114,7 @@ type Model struct {
 // NewModel constructs a ready-to-run TUI model.
 func NewModel(mode session.Mode) Model {
 	fi := textinput.New()
-	fi.Placeholder = "filter by path or agent…"
+	fi.Placeholder = "filter by title, session ID, path or agent…"
 	fi.Prompt = "  "
 	fi.CharLimit = 256
 	fi.Width = 60
@@ -108,8 +141,8 @@ func (m Model) Init() tea.Cmd {
 }
 
 type scanDoneMsg struct {
-	groups []Group
-	err    error
+	sessions []session.Session
+	err      error
 }
 
 type applyDoneMsg struct {
@@ -131,8 +164,7 @@ func scanCmd() tea.Cmd {
 			}
 			all = append(all, s...)
 		}
-		grouped := groupSessions(all)
-		return scanDoneMsg{groups: grouped}
+		return scanDoneMsg{sessions: all}
 	}
 }
 
@@ -142,7 +174,7 @@ func groupSessions(sessions []session.Session) []Group {
 		key := s.Agent + "\x00" + s.CWD
 		g, ok := bucket[key]
 		if !ok {
-			g = &Group{Agent: s.Agent, CWD: s.CWD}
+			g = &Group{Agent: s.Agent, CWD: s.CWD, Scope: session.ScopeProject}
 			bucket[key] = g
 		}
 		g.Sessions = append(g.Sessions, s)
@@ -164,6 +196,35 @@ func groupSessions(sessions []session.Session) []Group {
 	return out
 }
 
+func (m *Model) rebuildRows() {
+	m.groups = nil
+	if m.scope == session.ScopeProject {
+		m.groups = groupSessions(m.sessions)
+	} else {
+		for _, s := range m.sessions {
+			if s.ProjectOnly {
+				continue
+			}
+			m.groups = append(m.groups, Group{
+				Agent: s.Agent, CWD: s.CWD, Sessions: []session.Session{s},
+				Latest: s.Modified, Bytes: s.Size,
+			})
+		}
+		sort.SliceStable(m.groups, func(i, j int) bool {
+			a, b := m.groups[i], m.groups[j]
+			if !a.Latest.Equal(b.Latest) {
+				return a.Latest.After(b.Latest)
+			}
+			return a.Agent+"\x00"+a.CWD+"\x00"+a.Sessions[0].ID < b.Agent+"\x00"+b.CWD+"\x00"+b.Sessions[0].ID
+		})
+	}
+	// Changing scope must never silently expand a session selection to a project.
+	m.selected = map[int]bool{}
+	m.cursor, m.scroll = 0, 0
+	m.err = nil
+	m.refilter()
+}
+
 // Update is the Bubble Tea reducer.
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
@@ -172,9 +233,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.height = msg.Height
 		m.adjustScroll()
 	case scanDoneMsg:
-		m.groups = msg.groups
+		m.sessions = msg.sessions
+		m.rebuildRows()
 		m.err = msg.err
-		m.refilter()
 		m.phase = phaseList
 		return m, nil
 	case applyDoneMsg:
@@ -255,7 +316,15 @@ func (m Model) handleListKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.adjustScroll()
 			return m, nil
 		}
-	case " ", "tab":
+	case "tab":
+		if m.scope == session.ScopeSession {
+			m.scope = session.ScopeProject
+		} else {
+			m.scope = session.ScopeSession
+		}
+		m.rebuildRows()
+		return m, nil
+	case " ":
 		if len(m.visible) == 0 {
 			return m, nil
 		}
@@ -384,16 +453,19 @@ func runApply(plans []session.Plan) applyDoneMsg {
 
 func buildPlans(m Model, newCWD string) ([]session.Plan, error) {
 	var plans []session.Plan
+	var selected []session.Session
 	for idx := range m.selected {
 		if !m.selected[idx] {
 			continue
 		}
-		g := m.groups[idx]
+		selected = append(selected, m.groups[idx].Sessions...)
+	}
+	for _, g := range groupSessions(selected) {
 		a, err := adapter.ByName(g.Agent)
 		if err != nil {
 			return nil, err
 		}
-		p, err := a.Plan(g.Sessions, session.PlanOpts{NewCWD: newCWD, Mode: m.mode})
+		p, err := a.Plan(g.Sessions, session.PlanOpts{NewCWD: paths.NormalizeCWD(newCWD), Mode: m.mode, Scope: m.scope})
 		if err != nil {
 			return nil, err
 		}
@@ -433,9 +505,9 @@ func (m *Model) refilter() {
 // the current terminal height. Each group renders as two lines (title +
 // description); the chrome above and below the list is fixed.
 func (m Model) listCapacity() int {
-	// chrome: frame padding (top+bottom = 2) + title + filter line + blank +
-	// trailing blank + help line + mode line = 7 fixed lines.
-	const chrome = 9
+	// Frame padding, title, filter, spacing, overflow hint, two help lines,
+	// and the operation label occupy ten lines outside the two-line rows.
+	const chrome = 10
 	if m.height <= 0 {
 		return 8 // sensible default before first WindowSizeMsg arrives
 	}
@@ -509,7 +581,7 @@ func (m Model) View() string {
 
 func (m Model) viewList() string {
 	var b strings.Builder
-	fmt.Fprintln(&b, titleStyle.Render("mvs · sessions"))
+	fmt.Fprintln(&b, titleStyle.Render("mvs · "+m.scope.String()+"s")+"  "+dimStyle.Render("tab: switch sessions/projects (clears selection)"))
 	fmt.Fprintln(&b, dimStyle.Render("filter:")+" "+m.filter.View())
 	fmt.Fprintln(&b, "")
 	if len(m.groups) == 0 {
@@ -537,10 +609,15 @@ func (m Model) viewList() string {
 			marker = selectedStyle.Render("[x]")
 		}
 		pointer := "  "
+		title, description := displayText(g.Title()), displayText(g.Description())
+		if m.width > 12 {
+			rowStyle := lipgloss.NewStyle().MaxWidth(m.width - 12)
+			title, description = rowStyle.Render(title), rowStyle.Render(description)
+		}
 		line := fmt.Sprintf(" %s %s\n      %s",
 			marker,
-			g.Title(),
-			dimStyle.Render(g.Description()))
+			title,
+			dimStyle.Render(description))
 		if vi == m.cursor {
 			pointer = cursorStyle.Render("▸ ")
 			line = cursorStyle.Render(line)
@@ -559,7 +636,8 @@ func (m Model) viewList() string {
 		fmt.Fprintln(&b, "")
 	}
 	fmt.Fprintln(&b, dimStyle.Render(
-		"↑/↓ pgup/pgdn g/G  space: select  enter: continue  ctrl+a: all  ctrl+x: clear  q: quit"))
+		"↑/↓ pgup/pgdn g/G  space: select  enter: continue"))
+	fmt.Fprintln(&b, dimStyle.Render("ctrl+a: all filtered  ctrl+x: clear  q: quit"))
 	fmt.Fprintf(&b, "%s %s\n",
 		dimStyle.Render("mode:"),
 		accentStyle.Render(strings.ToUpper(m.mode.String())))
@@ -576,7 +654,7 @@ func (m Model) viewTarget() string {
 			count++
 		}
 	}
-	fmt.Fprintln(&b, dimStyle.Render(fmt.Sprintf("%d group(s) selected.", count)))
+	fmt.Fprintln(&b, dimStyle.Render(fmt.Sprintf("%d %s(s) selected.", count, m.scope.String())))
 	fmt.Fprintln(&b, "")
 	fmt.Fprintln(&b, "Enter the new cwd (absolute path, ~ supported):")
 	fmt.Fprintln(&b, m.target.View())
@@ -599,12 +677,15 @@ func (m Model) viewConfirm() string {
 	var b strings.Builder
 	fmt.Fprintln(&b, titleStyle.Render("mvs · confirm"))
 	fmt.Fprintln(&b, "")
-	fmt.Fprintf(&b, "mode: %s\n", accentStyle.Render(strings.ToUpper(m.mode.String())))
+	fmt.Fprintf(&b, "selection: %s · operation: %s\n", m.scope.String(), accentStyle.Render(strings.ToUpper(m.mode.String())))
 	fmt.Fprintln(&b, "")
 	for _, p := range m.plans {
 		fmt.Fprintf(&b, "%s  %s → %s\n",
 			accentStyle.Render("["+p.Agent+"]"),
 			p.OldCWD, p.NewCWD)
+		if p.Scope == session.ScopeSession.String() {
+			fmt.Fprintf(&b, "    selected sessions: %s\n", strings.Join(p.SessionIDs, ", "))
+		}
 		for _, a := range p.Actions {
 			fmt.Fprintf(&b, "    %s  %s %s\n",
 				dimStyle.Render("·"),

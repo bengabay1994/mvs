@@ -306,7 +306,7 @@ func removeCreatedTargets(reports []session.Report) error {
 				continue
 			}
 			switch action.Kind {
-			case "copy_file", "copy_dir", "move_file", "move_dir", "rename_dir", "write_file":
+			case "copy_file", "copy_dir", "move_file", "move_dir", "rename_dir", "write_file", "mkdir":
 				if err := os.RemoveAll(action.Target); err != nil {
 					return fmt.Errorf("remove created target %s: %w", action.Target, err)
 				}
@@ -352,7 +352,7 @@ func restoreClaude(runDir string, plan session.Plan) error {
 	if srcSnap != "" && plan.Mode == session.ModeMove.String() {
 		srcDir := filepath.Join(root, "projects", encOld)
 		for _, action := range plan.Actions {
-			if action.Kind != "move_file" {
+			if action.Kind != "move_file" && action.Kind != "move_dir" {
 				continue
 			}
 			rel, err := filepath.Rel(srcDir, action.From)
@@ -361,6 +361,12 @@ func restoreClaude(runDir string, plan session.Plan) error {
 			}
 			snapshot := filepath.Join(srcSnap, rel)
 			if pathExists(snapshot) {
+				if action.Kind == "move_dir" {
+					if err := copyTreeOrFail(snapshot, action.From); err != nil {
+						return err
+					}
+					continue
+				}
 				if err := copyFileOrFail(snapshot, action.From); err != nil {
 					return err
 				}
@@ -411,6 +417,29 @@ func restoreCodex(runDir string, plan session.Plan) error {
 func restoreGemini(runDir string, plan session.Plan) error {
 	bk := filepath.Join(runDir, "gemini")
 	root := paths.GeminiRoot()
+	if plan.Scope == session.ScopeSession.String() {
+		if pathExists(filepath.Join(bk, "projects.json")) {
+			if err := copyFileOrFail(filepath.Join(bk, "projects.json"), filepath.Join(root, "projects.json")); err != nil {
+				return err
+			}
+		}
+		for _, action := range plan.Actions {
+			if action.Kind != "move_file" {
+				continue
+			}
+			rel, err := filepath.Rel(root, action.From)
+			if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) || filepath.IsAbs(rel) {
+				return fmt.Errorf("invalid Gemini source in backup: %s", action.From)
+			}
+			snapshot := filepath.Join(bk, "files", rel)
+			if pathExists(snapshot) {
+				if err := copyFileOrFail(snapshot, action.From); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
 	// Restore both tmp-<oldID> and history-<oldID>, and projects.json.
 	entries, _ := os.ReadDir(bk)
 	for _, e := range entries {
@@ -582,6 +611,11 @@ func copyTreeOrFail(src, dst string) error {
 			link, lerr := os.Readlink(p)
 			if lerr != nil {
 				return lerr
+			}
+			// In-place migrations can leave an unchanged companion symlink at
+			// its original location. Restoring it must be idempotent.
+			if existing, err := os.Readlink(target); err == nil && existing == link {
+				return nil
 			}
 			_ = os.MkdirAll(filepath.Dir(target), 0o755)
 			return os.Symlink(link, target)

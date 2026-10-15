@@ -7,13 +7,30 @@ import (
 
 // Session is a single agent conversation transcript scoped to a working directory.
 type Session struct {
-	Agent    string    // "claude" | "codex" | "gemini" | "opencode"
-	ID       string    // agent-native id (uuid, filename, etc.)
-	CWD      string    // the canonical cwd this session was bound to
-	Title    string    // best-effort human label
-	Modified time.Time // last activity time
-	Size     int64     // primary file size in bytes
-	Path     string    // primary on-disk path (file or dir)
+	Agent       string    // "claude" | "codex" | "gemini" | "opencode"
+	ID          string    // agent-native id (uuid, filename, etc.)
+	CWD         string    // the canonical cwd this session was bound to
+	Title       string    // best-effort human label
+	Modified    time.Time // last activity time
+	Size        int64     // primary file size in bytes
+	Path        string    // primary on-disk path (file or dir)
+	ProjectOnly bool      // project storage without an individual conversation
+}
+
+// Scope selects individual conversations or an entire agent/project store.
+// Session scope is the default; move/copy is a separate choice.
+type Scope int
+
+const (
+	ScopeSession Scope = iota
+	ScopeProject
+)
+
+func (s Scope) String() string {
+	if s == ScopeProject {
+		return "project"
+	}
+	return "session"
 }
 
 // Mode selects move-vs-copy semantics during migration.
@@ -35,6 +52,7 @@ func (m Mode) String() string {
 type PlanOpts struct {
 	NewCWD string
 	Mode   Mode
+	Scope  Scope
 }
 
 // ApplyOpts controls migration execution.
@@ -58,11 +76,13 @@ type Action struct {
 
 // Plan is the ordered list of actions an adapter intends to run.
 type Plan struct {
-	Agent   string   `json:"agent"`
-	OldCWD  string   `json:"old_cwd"`
-	NewCWD  string   `json:"new_cwd"`
-	Mode    string   `json:"mode"`
-	Actions []Action `json:"actions"`
+	Agent      string   `json:"agent"`
+	OldCWD     string   `json:"old_cwd"`
+	NewCWD     string   `json:"new_cwd"`
+	Mode       string   `json:"mode"`
+	Scope      string   `json:"scope,omitempty"`
+	SessionIDs []string `json:"session_ids,omitempty"`
+	Actions    []Action `json:"actions"`
 }
 
 // Report is the result of executing a Plan.

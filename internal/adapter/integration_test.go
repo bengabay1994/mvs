@@ -43,7 +43,7 @@ func TestClaudeMovePreservesSessionsInLossyDirectoryAndUndoes(t *testing.T) {
 			selected = append(selected, item)
 		}
 	}
-	plan, err := a.Plan(selected, session.PlanOpts{NewCWD: newCWD, Mode: session.ModeMove})
+	plan, err := a.Plan(selected, session.PlanOpts{Scope: session.ScopeProject, NewCWD: newCWD, Mode: session.ModeMove})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -111,7 +111,7 @@ func TestClaudePlanRejectsConflictingProjectMetadata(t *testing.T) {
 	}})
 
 	a := &Claude{}
-	_, err := a.Plan([]session.Session{{Agent: "claude", ID: "session", CWD: oldCWD, Path: source}}, session.PlanOpts{
+	_, err := a.Plan([]session.Session{{Agent: "claude", ID: "session", CWD: oldCWD, Path: source}}, session.PlanOpts{Scope: session.ScopeProject,
 		NewCWD: newCWD,
 		Mode:   session.ModeMove,
 	})
@@ -159,7 +159,7 @@ func TestCodexCopyCreatesValidRolloutAndUndoRemovesIt(t *testing.T) {
 	}
 
 	a := &Codex{}
-	plan, err := a.Plan([]session.Session{{Agent: "codex", ID: oldID, CWD: oldCWD, Path: rollout}}, session.PlanOpts{
+	plan, err := a.Plan([]session.Session{{Agent: "codex", ID: oldID, CWD: oldCWD, Path: rollout}}, session.PlanOpts{Scope: session.ScopeProject,
 		NewCWD: newCWD,
 		Mode:   session.ModeCopy,
 	})
@@ -254,7 +254,7 @@ func TestGeminiMoveUpdatesRegistryWithoutMovingSlugStoreAndUndoes(t *testing.T) 
 	mustWriteFile(t, historyMarker, geminiNormalize(oldCWD)+"\n")
 
 	a := &Gemini{}
-	plan, err := a.Plan([]session.Session{{Agent: "gemini", ID: id, CWD: oldCWD, Path: chat}}, session.PlanOpts{
+	plan, err := a.Plan([]session.Session{{Agent: "gemini", ID: id, CWD: oldCWD, Path: chat}}, session.PlanOpts{Scope: session.ScopeProject,
 		NewCWD: newCWD,
 		Mode:   session.ModeMove,
 	})
@@ -321,7 +321,7 @@ func TestGeminiUndoRemovesMetadataCreatedByMove(t *testing.T) {
 	mustWriteJSONLine(t, chat, map[string]any{"projectHash": sha256Hex(oldCWD), "directories": []string{oldCWD}})
 
 	a := &Gemini{}
-	plan, err := a.Plan([]session.Session{{Agent: "gemini", ID: oldID, CWD: oldCWD, Path: chat}}, session.PlanOpts{
+	plan, err := a.Plan([]session.Session{{Agent: "gemini", ID: oldID, CWD: oldCWD, Path: chat}}, session.PlanOpts{Scope: session.ScopeProject,
 		NewCWD: newCWD,
 		Mode:   session.ModeMove,
 	})
@@ -368,7 +368,7 @@ func TestGeminiCopyUndoDoesNotOverwriteActiveSource(t *testing.T) {
 	mustWriteFile(t, sourceHistoryMarker, geminiNormalize(oldCWD)+"\n")
 
 	a := &Gemini{}
-	plan, err := a.Plan([]session.Session{{Agent: "gemini", ID: id, CWD: oldCWD, Path: chat}}, session.PlanOpts{
+	plan, err := a.Plan([]session.Session{{Agent: "gemini", ID: id, CWD: oldCWD, Path: chat}}, session.PlanOpts{Scope: session.ScopeProject,
 		NewCWD: newCWD,
 		Mode:   session.ModeCopy,
 	})
@@ -432,7 +432,7 @@ func TestOpenCodeMovePreservesRelativePathAndHistoricalDataAndUndoes(t *testing.
 	mustWriteFile(t, filepath.Join(oldSnapshot, "state"), "snapshot")
 
 	a := &OpenCode{}
-	plan, err := a.Plan([]session.Session{{Agent: "opencode", ID: "session-1", CWD: oldCWD}}, session.PlanOpts{
+	plan, err := a.Plan([]session.Session{{Agent: "opencode", ID: "session-1", CWD: oldCWD}}, session.PlanOpts{Scope: session.ScopeProject,
 		NewCWD: newCWD,
 		Mode:   session.ModeMove,
 	})
@@ -501,7 +501,7 @@ func TestOpenCodeMovePreservesRelativePathAndHistoricalDataAndUndoes(t *testing.
 		t.Fatalf("new snapshot remains after undo: %v", err)
 	}
 
-	if _, err := a.Plan([]session.Session{{Agent: "opencode", ID: "session-1", CWD: oldCWD}}, session.PlanOpts{
+	if _, err := a.Plan([]session.Session{{Agent: "opencode", ID: "session-1", CWD: oldCWD}}, session.PlanOpts{Scope: session.ScopeProject,
 		NewCWD: newCWD,
 		Mode:   session.ModeCopy,
 	}); err == nil {

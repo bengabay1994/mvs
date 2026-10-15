@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/bengabay1994/mvs/internal/paths"
 	"github.com/bengabay1994/mvs/internal/session"
@@ -26,9 +27,9 @@ import (
 //
 // project.worktree holds the canonical cwd; session.directory mirrors it. The
 // project_id is git-derived and survives renames as long as .git/opencode stays
-// intact, so migration boils down to: rewrite the directory/path columns,
-// REPLACE() across part.data + message.data JSON blobs, and rename the
-// per-cwd snapshot subdir.
+// intact. Project mode rewrites shared paths and renames snapshot stores;
+// session mode rebinds selected rows and copies shared snapshots. Historical
+// message/part JSON bodies are preserved.
 type OpenCode struct{}
 
 func (o *OpenCode) Name() string { return "opencode" }
@@ -75,11 +76,12 @@ func (o *OpenCode) Discover() ([]session.Session, error) {
 			continue
 		}
 		out = append(out, session.Session{
-			Agent: o.Name(),
-			ID:    id,
-			CWD:   filepath.FromSlash(dir),
-			Title: title,
-			Path:  dbPath + "#" + id,
+			Agent:    o.Name(),
+			ID:       id,
+			CWD:      filepath.FromSlash(dir),
+			Title:    title,
+			Modified: time.UnixMilli(ts),
+			Path:     dbPath + "#" + id,
 		})
 	}
 	return out, nil
@@ -99,10 +101,15 @@ func (o *OpenCode) Plan(sessions []session.Session, opts session.PlanOpts) (sess
 		}
 	}
 	plan := session.Plan{
-		Agent:  o.Name(),
-		OldCWD: oldCWD,
-		NewCWD: opts.NewCWD,
-		Mode:   opts.Mode.String(),
+		Agent:      o.Name(),
+		OldCWD:     oldCWD,
+		NewCWD:     opts.NewCWD,
+		Mode:       opts.Mode.String(),
+		Scope:      opts.Scope.String(),
+		SessionIDs: selectedIDs(sessions),
+	}
+	if opts.Scope == session.ScopeSession {
+		return planOpenCodeSessions(plan)
 	}
 	dbPath := filepath.Join(paths.OpenCodeRoot(), "opencode.db")
 	if err := validateOpenCodeSnapshotTargets(opts.NewCWD, oldCWD, opts.Mode); err != nil {
@@ -127,6 +134,9 @@ func sha1Hex(s string) string {
 }
 
 func (o *OpenCode) Apply(plan session.Plan, opts session.ApplyOpts) session.Report {
+	if plan.Scope == session.ScopeSession.String() {
+		return applyOpenCodeSessions(plan, opts)
+	}
 	r := session.Report{Agent: o.Name(), OK: true}
 	addErr := func(format string, args ...any) {
 		r.OK = false

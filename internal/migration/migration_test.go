@@ -38,7 +38,7 @@ func TestExecuteRollsBackEarlierAdaptersWhenLaterAdapterFails(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	claudePlan, err := claude.Plan(discovered, session.PlanOpts{NewCWD: newCWD, Mode: session.ModeMove})
+	claudePlan, err := claude.Plan(discovered, session.PlanOpts{Scope: session.ScopeProject, NewCWD: newCWD, Mode: session.ModeMove})
 	if err != nil {
 		t.Fatal(err)
 	}

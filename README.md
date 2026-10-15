@@ -134,6 +134,8 @@ Each agent stores sessions differently. Renaming `~/.claude/projects/<encoded-ol
 
 ## Development
 
+The tool version lives only in [`VERSION`](VERSION). Update that file once per logical update using the appropriate patch, minor, or major increment. Go embeds it directly into the executable, and the Makefile reads it for release artifact names. Direct Go builds, Makefile builds, and the Windows installer all use the same value; build-time version overrides are not supported.
+
 ```
 make build                     # ./mvs
 make release                   # cross-compile all platforms to dist/

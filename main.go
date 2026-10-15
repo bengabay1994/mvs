@@ -10,6 +10,7 @@
 package main
 
 import (
+	_ "embed"
 	"flag"
 	"fmt"
 	"os"
@@ -45,7 +46,8 @@ global flags:
   --help                  this message
 `
 
-var version = "0.2.0"
+//go:embed VERSION
+var version string
 
 func main() {
 	if len(os.Args) < 2 {
@@ -56,7 +58,7 @@ func main() {
 	case "-h", "--help", "help":
 		fmt.Print(usage)
 	case "--version":
-		fmt.Println("mvs", version)
+		fmt.Println("mvs", strings.TrimSpace(version))
 	case "list":
 		runList(os.Args[2:])
 	case "doctor":

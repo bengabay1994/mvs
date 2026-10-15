@@ -1,17 +1,17 @@
 # mvs — migrate agent session history between project directories
 
-You named a project `projname1`, spent a week talking to Claude Code, Codex, Gemini CLI, and OpenCode inside it, then renamed the folder to `projname2`. Now `claude --resume`, `codex resume`, etc. show no history in the new folder — your transcripts are still on disk, just keyed by the old path.
+You want to continue a conversation in another workspace, or you renamed a project folder and its history disappeared from `claude --resume`, `codex resume`, etc. The transcripts are still on disk, keyed by their original project path.
 
-`mvs` shows you every session every supported agent ever stored, lets you fuzzy-filter to the project you're looking for, asks where it should live now, and rewrites every file each agent needs touched so resume works from the new location.
+`mvs` means **move session**. It lists individual conversations by default: pick one session (or several), choose a new project/workspace path, and resume there. Press `tab` in the list to switch to **project mode** when you want to migrate every session for an agent at a source path.
 
 Supported agents:
 
-| Agent | What gets rewritten |
-| --- | --- |
-| Claude Code (`~/.claude`) | matching files under `projects/<encoded-cwd>/`, `cwd` field on every selected JSONL line, `history.jsonl`, `~/.claude.json` `.projects` key |
-| Codex CLI (`~/.codex`)    | `payload.cwd` on `session_meta` and `turn_context` lines, `threads.cwd` in `state_5.sqlite` |
-| Gemini CLI (`~/.gemini`)  | `tmp/<id>/`, `history/<id>/`, `.project_root`, `projectHash` in chat headers, `projects.json` |
-| OpenCode (`~/.local/share/opencode`) | `session.directory`, `workspace.directory`, `project.worktree`/`sandboxes`, `snapshot/<id>/<sha1>/` rename |
+| Agent | Session mode (default) | Project mode |
+| --- | --- | --- |
+| Claude Code (`~/.claude`) | Selected transcripts and companion/subagent files; prompt history identified by session ID | All matching sessions, prompt history, and the `~/.claude.json` project key |
+| Codex CLI (`~/.codex`) | Selected rollout metadata and corresponding `threads` rows in `state_5.sqlite` | Every session at the source path |
+| Gemini CLI (`~/.gemini`) | Selected chats, target ownership markers, and registry entry; source store retained | Entire `tmp/` and `history/` project stores, chat headers, and registry mapping |
+| OpenCode (`~/.local/share/opencode`) | Selected session rows rebound to the target project/workspace; shared snapshots copied | Session/workspace/project paths and per-cwd snapshot directories |
 
 ## Install
 
@@ -52,7 +52,7 @@ If the installation directory is not on `PATH`, the script prints a command that
 - darwin/arm64
 - windows/amd64
 
-Drop one into `~/.local/bin` on Unix. On Windows, rename the downloaded artifact to `$HOME\.local\bin\mvs.exe`. Ensure the applicable directory is on `PATH`. No runtime dependencies; SQLite is statically linked via `modernc.org/sqlite`.
+Drop one into `~/.local/bin` on Unix. On Windows, rename the downloaded artifact to `$HOME\.local\bin\mvs.exe`. Ensure the applicable directory is on `PATH`. SQLite is statically linked via `modernc.org/sqlite`. OpenCode session transfers to unregistered targets use Git to resolve the destination project identity.
 
 ## Usage
 
@@ -62,22 +62,32 @@ Drop one into `~/.local/bin` on Unix. On Windows, rename the downloaded artifact
 mvs
 ```
 
-Keys: type to fuzzy-filter, ↑/↓ to navigate, `space` to (de)select a project, `ctrl+a`/`ctrl+x` to toggle all, `enter` to continue, then type the new path, confirm.
+The default view lists individual sessions with a title (or ID), source path, and last activity. Type to fuzzy-filter by title, ID, path, or agent. Use ↑/↓ to navigate, `space` to select a session, and `enter` to enter the new path and review the plan.
+
+Press `tab` on the list screen to toggle **sessions ↔ projects**. Project rows group all sessions by agent and source path. Switching views clears the selection. `ctrl+a` selects all filtered rows; `ctrl+x` clears the selection. On the target screen, `tab` completes paths. The confirmation screen lists the selected session IDs in session mode.
+
+Selection scope (sessions/projects) is separate from the operation (move/copy). Move remains the default operation; use `mvs --copy` or press `c` on the confirmation screen for copy mode.
 
 ### Non-interactive
 
 ```
-mvs migrate /old/path /new/path                  # move (default)
-mvs migrate --copy /old/path /new/path           # duplicate, leave originals (except OpenCode)
-mvs migrate --agent claude /old/path /new/path   # scope to one agent
-mvs migrate --dry-run /old/path /new/path        # show the plan, write nothing
+mvs list                                        # find session IDs
+mvs migrate --agent claude --session ID /old/path /new/path
+mvs migrate --session ID1 --session ID2 /old/path /new/path
+mvs migrate --copy --session ID /old/path /new/path
+mvs migrate --dry-run --session ID /old/path /new/path
+mvs migrate --project /old/path /new/path         # all agents' sessions at the source
+mvs migrate --project --agent claude /old/path /new/path
 ```
+
+`migrate` requires `--session ID` (repeatable) or `--project`; these flags cannot be combined. A bare `mvs migrate FROM TO` fails with guidance instead of implicitly moving an entire project. Unknown or ambiguous session IDs also fail before any writes; use `--agent` to disambiguate IDs shared by agents.
 
 ### Other subcommands
 
 ```
 mvs doctor       # show which agents were detected and where
-mvs list         # print every (agent, cwd) group on disk
+mvs list         # print individual session IDs, paths, and titles
+mvs list --project # print every (agent, cwd) group on disk
 mvs undo RUN_ID  # restore from a backup snapshot
 mvs undo         # list known backup runs
 ```
@@ -102,11 +112,13 @@ Quit all supported agents before migrating or undoing. `mvs` takes consistent SQ
 
 Move semantics:
 
-- `move` (default): the old cwd no longer shows the session; the new one does. Matches the "I renamed my project" workflow.
+- `move` (default): selected sessions appear at the new cwd. Unselected conversations remain at their original location.
 - `--copy`: both cwds show the session for Claude, Codex, and Gemini.
 - OpenCode copy mode is deliberately disabled. Current OpenCode schemas contain additional session-owned tables, and cloning only the known tables can produce an incomplete session. Move mode is supported.
 
 `mvs` reads the canonical cwd from session metadata rather than reverse-engineering encoded directory names. For Claude, only matching transcript files are moved out of a lossy encoded directory, so unrelated sessions that collide under the encoding remain in place.
+
+Session mode leaves shared source-project settings in place. In particular, Claude trust/tool grants stay with their project, and only history entries carrying a selected `sessionId` move. Gemini session transfers can add chats to an existing target store; project mode retains the stricter whole-store collision checks. OpenCode session transfers retain shared source workspace/project metadata and snapshots; a child moved without its parent becomes a root session at the destination.
 
 ## Why this isn't a one-liner
 
@@ -143,13 +155,13 @@ internal/fsutil/         atomic replacement + drift fingerprints
 internal/tui/            Bubble Tea model (scan → list → target → confirm → apply)
 ```
 
-Adding a new agent: implement the `adapter.Adapter` interface, register it in `adapter.All()`. The TUI and all subcommands pick it up automatically.
+Adding a new agent: implement the `adapter.Adapter` interface for both session and project scopes, register it in `adapter.All()`, and add its restore policy in `internal/backup/backup.go`.
 
 ## Known limitations
 
-- The TUI groups sessions by (agent, cwd). All sessions belonging to the same group migrate together; selecting only some of them isn't supported.
 - Select at most one source path per agent in a run. This keeps backup and rollback boundaries unambiguous; run `mvs` again for another source path.
-- Gemini refuses to merge two existing project stores. Migrate before opening Gemini in the new folder, or move one store separately after backing it up.
+- Gemini project mode refuses to merge two existing project stores. Session mode accepts existing targets but refuses conversation filename collisions. Stores with no discoverable conversations are available only in project mode.
+- OpenCode session moves copy shared snapshots when present, reuse an identical target snapshot, and refuse conflicting snapshot stores. Resolving an unregistered target's identity requires Git on `PATH`; existing registered target projects need no Git lookup.
 - OpenCode `--copy` is not supported; use move mode.
 - `mvs` cannot reliably detect every running agent process across supported operating systems. Quit the running CLI before migrating or undoing.
 - Body text inside transcripts (tool output, model responses) that mentions the old path is left untouched; only structural fields are rewritten. This is intentional — model-visible content is historical and rewriting it would corrupt the conversation record.

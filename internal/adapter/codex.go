@@ -110,21 +110,25 @@ func readCodexMeta(path string) (cwd, id, title string) {
 	// Best-effort title: first user prompt on subsequent lines.
 	for sc.Scan() {
 		var probe struct {
-			Type    string          `json:"type"`
-			Payload json.RawMessage `json:"payload"`
+			Type    string `json:"type"`
+			Payload struct {
+				Type    string          `json:"type"`
+				Role    string          `json:"role"`
+				Message string          `json:"message"`
+				Content json.RawMessage `json:"content"`
+			} `json:"payload"`
 		}
 		if json.Unmarshal(sc.Bytes(), &probe) != nil {
 			continue
 		}
-		if probe.Type == "response_item" || probe.Type == "event_msg" {
-			s := string(probe.Payload)
-			if i := strings.Index(s, `"text":"`); i >= 0 {
-				rest := s[i+len(`"text":"`):]
-				if j := strings.Index(rest, `"`); j > 0 {
-					title = firstLine(rest[:j], 80)
-					break
-				}
-			}
+		if probe.Type == "event_msg" && probe.Payload.Type == "user_message" {
+			title = firstLine(probe.Payload.Message, 80)
+		}
+		if probe.Type == "response_item" && probe.Payload.Role == "user" {
+			title = firstLine(promptText(probe.Payload.Content), 80)
+		}
+		if title != "" {
+			break
 		}
 	}
 	return
@@ -141,10 +145,12 @@ func (c *Codex) Plan(sessions []session.Session, opts session.PlanOpts) (session
 		}
 	}
 	plan := session.Plan{
-		Agent:  c.Name(),
-		OldCWD: oldCWD,
-		NewCWD: opts.NewCWD,
-		Mode:   opts.Mode.String(),
+		Agent:      c.Name(),
+		OldCWD:     oldCWD,
+		NewCWD:     opts.NewCWD,
+		Mode:       opts.Mode.String(),
+		Scope:      opts.Scope.String(),
+		SessionIDs: selectedIDs(sessions),
 	}
 	for _, s := range sessions {
 		if opts.Mode == session.ModeCopy {

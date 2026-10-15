@@ -150,13 +150,14 @@ func (g *Gemini) Discover() ([]session.Session, error) {
 				modTime := info.ModTime()
 				size := info.Size()
 				out = append(out, session.Session{
-					Agent:    g.Name(),
-					ID:       sub + "/" + id,
-					CWD:      cwd,
-					Title:    "(no chats recorded)",
-					Modified: modTime,
-					Size:     size,
-					Path:     filepath.Join(base, id),
+					Agent:       g.Name(),
+					ID:          sub + "/" + id,
+					CWD:         cwd,
+					Title:       "(no chats recorded)",
+					Modified:    modTime,
+					Size:        size,
+					Path:        filepath.Join(base, id),
+					ProjectOnly: true,
 				})
 				continue
 			}
@@ -194,16 +195,21 @@ func (g *Gemini) Plan(sessions []session.Session, opts session.PlanOpts) (sessio
 		}
 	}
 	plan := session.Plan{
-		Agent:  g.Name(),
-		OldCWD: oldCWD,
-		NewCWD: opts.NewCWD,
-		Mode:   opts.Mode.String(),
+		Agent:      g.Name(),
+		OldCWD:     oldCWD,
+		NewCWD:     opts.NewCWD,
+		Mode:       opts.Mode.String(),
+		Scope:      opts.Scope.String(),
+		SessionIDs: selectedIDs(sessions),
 	}
 	registry, err := readGeminiProjects()
 	if err != nil {
 		return session.Plan{}, err
 	}
 	oldID := resolveGeminiID(oldCWD, registry)
+	if opts.Scope == session.ScopeSession {
+		return planGeminiSessions(plan, sessions, oldID, registry, opts.Mode)
+	}
 	newID, err := geminiDestinationID(oldID, opts.NewCWD, registry, opts.Mode)
 	if err != nil {
 		return session.Plan{}, err
@@ -283,6 +289,9 @@ func geminiDestinationID(oldID, newCWD string, registry map[string]string, mode 
 }
 
 func (g *Gemini) Apply(plan session.Plan, opts session.ApplyOpts) session.Report {
+	if plan.Scope == session.ScopeSession.String() {
+		return applyGeminiSessions(plan, opts)
+	}
 	r := session.Report{Agent: g.Name(), OK: true}
 	addErr := func(format string, args ...any) {
 		r.OK = false

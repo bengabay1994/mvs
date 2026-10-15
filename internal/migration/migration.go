@@ -76,6 +76,21 @@ func Validate(plans []session.Plan) error {
 		if plan.Mode != session.ModeMove.String() && plan.Mode != session.ModeCopy.String() {
 			return fmt.Errorf("%s plan has invalid mode %q", plan.Agent, plan.Mode)
 		}
+		if plan.Scope != "" && plan.Scope != session.ScopeSession.String() && plan.Scope != session.ScopeProject.String() {
+			return fmt.Errorf("%s plan has invalid selection scope %q", plan.Agent, plan.Scope)
+		}
+		if plan.Scope == session.ScopeSession.String() && len(plan.SessionIDs) == 0 {
+			return fmt.Errorf("%s session plan has no selected session IDs", plan.Agent)
+		}
+		if plan.Scope == session.ScopeSession.String() {
+			ids := make(map[string]bool, len(plan.SessionIDs))
+			for _, id := range plan.SessionIDs {
+				if id == "" || ids[id] {
+					return fmt.Errorf("%s session plan has an empty or duplicate session ID", plan.Agent)
+				}
+				ids[id] = true
+			}
+		}
 		if _, exists := seenAgents[plan.Agent]; exists {
 			return fmt.Errorf("select only one source path per agent in each run; %s appears more than once", plan.Agent)
 		}

@@ -3,6 +3,7 @@ package adapter
 
 import (
 	"fmt"
+	"sort"
 
 	"github.com/bengabay1994/mvs/internal/session"
 )
@@ -21,6 +22,15 @@ type Adapter interface {
 	Plan(sessions []session.Session, opts session.PlanOpts) (session.Plan, error)
 	// Apply executes the plan. Backups are written under opts.BackupDir.
 	Apply(plan session.Plan, opts session.ApplyOpts) session.Report
+}
+
+func selectedIDs(sessions []session.Session) []string {
+	ids := make([]string, 0, len(sessions))
+	for _, s := range sessions {
+		ids = append(ids, s.ID)
+	}
+	sort.Strings(ids)
+	return ids
 }
 
 // All returns the adapters compiled into this binary.

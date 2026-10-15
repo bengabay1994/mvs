@@ -133,11 +133,38 @@ func readClaudeMeta(p string) (cwd, title string) {
 				}
 			}
 		}
+		if title == "" && lineHasTopLevelStringField(sc.Bytes(), "type", "user") {
+			var message struct {
+				Content json.RawMessage `json:"content"`
+			}
+			if json.Unmarshal(m["message"], &message) == nil {
+				title = firstLine(promptText(message.Content), 80)
+			}
+		}
 		if cwd != "" && title != "" {
 			break
 		}
 	}
 	return cwd, title
+}
+
+func promptText(raw json.RawMessage) string {
+	var text string
+	if json.Unmarshal(raw, &text) == nil {
+		return text
+	}
+	var blocks []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if json.Unmarshal(raw, &blocks) == nil {
+		for _, b := range blocks {
+			if (b.Type == "text" || b.Type == "input_text") && b.Text != "" {
+				return b.Text
+			}
+		}
+	}
+	return ""
 }
 
 func firstLine(s string, max int) string {
@@ -161,7 +188,7 @@ func (c *Claude) Plan(sessions []session.Session, opts session.PlanOpts) (sessio
 		}
 	}
 	newCWD := opts.NewCWD
-	if paths.Exists(paths.ClaudeJSON()) {
+	if opts.Scope == session.ScopeProject && paths.Exists(paths.ClaudeJSON()) {
 		if err := validateClaudeProjectMetadataTarget(paths.ClaudeJSON(), oldCWD, newCWD); err != nil {
 			return session.Plan{}, err
 		}
@@ -172,10 +199,12 @@ func (c *Claude) Plan(sessions []session.Session, opts session.PlanOpts) (sessio
 	dstDir := filepath.Join(root, "projects", encNew)
 
 	plan := session.Plan{
-		Agent:  c.Name(),
-		OldCWD: oldCWD,
-		NewCWD: newCWD,
-		Mode:   opts.Mode.String(),
+		Agent:      c.Name(),
+		OldCWD:     oldCWD,
+		NewCWD:     newCWD,
+		Mode:       opts.Mode.String(),
+		Scope:      opts.Scope.String(),
+		SessionIDs: selectedIDs(sessions),
 	}
 	if opts.Mode == session.ModeCopy && encOld == encNew {
 		return session.Plan{}, fmt.Errorf("cannot copy Claude sessions because %q and %q share the same encoded storage directory", oldCWD, newCWD)
@@ -195,6 +224,18 @@ func (c *Claude) Plan(sessions []session.Session, opts session.PlanOpts) (sessio
 			Target: target,
 			Detail: "place transcript and rewrite top-level cwd",
 		})
+		companion := filepath.Join(filepath.Dir(s.Path), s.ID)
+		if paths.Exists(companion) {
+			destination := filepath.Join(dstDir, s.ID)
+			if companion != destination && paths.Exists(destination) {
+				return session.Plan{}, fmt.Errorf("Claude destination companion directory already exists: %s", destination)
+			}
+			kind := "move_dir"
+			if opts.Mode == session.ModeCopy {
+				kind = "copy_dir"
+			}
+			plan.Actions = append(plan.Actions, session.Action{Kind: kind, From: companion, Target: destination, Detail: "transfer this session's subagents and companion files"})
+		}
 	}
 	plan.Actions = append(plan.Actions,
 		session.Action{
@@ -202,12 +243,14 @@ func (c *Claude) Plan(sessions []session.Session, opts session.PlanOpts) (sessio
 			Target: filepath.Join(root, "history.jsonl"),
 			Detail: "rewrite project field on matching lines",
 		},
-		session.Action{
+	)
+	if opts.Scope == session.ScopeProject {
+		plan.Actions = append(plan.Actions, session.Action{
 			Kind:   "write_file",
 			Target: paths.ClaudeJSON(),
 			Detail: "rename .projects[" + oldCWD + "] key",
-		},
-	)
+		})
+	}
 	return plan, nil
 }
 
@@ -245,7 +288,7 @@ func (c *Claude) Apply(plan session.Plan, opts session.ApplyOpts) session.Report
 				return r
 			}
 		}
-		if paths.Exists(claudeJSON) {
+		if plan.Scope != session.ScopeSession.String() && paths.Exists(claudeJSON) {
 			if err := copyFile(claudeJSON, filepath.Join(bkRoot, "claude.json")); err != nil {
 				addErr("backup .claude.json: %v", err)
 				return r
@@ -267,6 +310,14 @@ func (c *Claude) Apply(plan session.Plan, opts session.ApplyOpts) session.Report
 		}
 	}
 	for _, action := range plan.Actions {
+		if action.Kind == "move_dir" || action.Kind == "copy_dir" {
+			if !opts.DryRun {
+				if err := applyClaudeCompanion(action, plan, &r); err != nil {
+					addErr("transfer companion %s: %v", action.From, err)
+				}
+			}
+			continue
+		}
 		if action.Kind != "move_file" && action.Kind != "copy_file" {
 			continue
 		}
@@ -318,7 +369,13 @@ func (c *Claude) Apply(plan session.Plan, opts session.ApplyOpts) session.Report
 
 	// 3. history.jsonl — rewrite the `project` field on matching lines.
 	if paths.Exists(historyFile) && !opts.DryRun {
-		if err := rewriteHistoryJSONL(historyFile, plan.OldCWD, plan.NewCWD, plan.Mode == "copy"); err != nil {
+		var err error
+		if plan.Scope == session.ScopeSession.String() {
+			err = rewriteSessionHistoryJSONL(historyFile, plan)
+		} else {
+			err = rewriteHistoryJSONL(historyFile, plan.OldCWD, plan.NewCWD, plan.Mode == "copy")
+		}
+		if err != nil {
 			addErr("rewrite history.jsonl: %v", err)
 		} else {
 			r.Applied = append(r.Applied, session.Action{Kind: "write_file", Target: historyFile})
@@ -326,7 +383,7 @@ func (c *Claude) Apply(plan session.Plan, opts session.ApplyOpts) session.Report
 	}
 
 	// 4. ~/.claude.json — rename projects[oldCWD] key.
-	if paths.Exists(claudeJSON) && !opts.DryRun {
+	if plan.Scope != session.ScopeSession.String() && paths.Exists(claudeJSON) && !opts.DryRun {
 		if err := renameClaudeJSONProjectKey(claudeJSON, plan.OldCWD, plan.NewCWD, plan.Mode == "copy"); err != nil {
 			addErr("rewrite .claude.json: %v", err)
 		} else {
@@ -336,6 +393,68 @@ func (c *Claude) Apply(plan session.Plan, opts session.ApplyOpts) session.Report
 
 	finalizeReportDigests(&r)
 	return r
+}
+
+func applyClaudeCompanion(action session.Action, plan session.Plan, report *session.Report) error {
+	created := action.From != action.Target
+	if created && paths.Exists(action.Target) {
+		return fmt.Errorf("destination already exists: %s", action.Target)
+	}
+	report.Applied = append(report.Applied, session.Action{Kind: action.Kind, From: action.From, Target: action.Target, Created: created})
+	if created {
+		if action.Kind == "move_dir" {
+			if err := os.Rename(action.From, action.Target); err != nil {
+				if err := copyTree(action.From, action.Target); err != nil {
+					return err
+				}
+				if err := os.RemoveAll(action.From); err != nil {
+					return err
+				}
+			}
+		} else if err := copyTree(action.From, action.Target); err != nil {
+			return err
+		}
+	}
+	return filepath.WalkDir(action.Target, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.Type().IsRegular() && strings.HasSuffix(entry.Name(), ".jsonl") {
+			return rewriteJSONLField(path, "cwd", plan.OldCWD, plan.NewCWD)
+		}
+		return nil
+	})
+}
+
+// Session history entries without a sessionId cannot be attributed safely.
+// Leave those and other conversations' prompts at their original project.
+func rewriteSessionHistoryJSONL(path string, plan session.Plan) error {
+	ids := make(map[string]bool, len(plan.SessionIDs))
+	for _, id := range plan.SessionIDs {
+		ids[id] = true
+	}
+	var rewriteErr error
+	err := streamRewriteLines(path, func(line []byte) []byte {
+		var entry struct {
+			SessionID string `json:"sessionId"`
+			Project   string `json:"project"`
+		}
+		if json.Unmarshal(line, &entry) != nil || !ids[entry.SessionID] || entry.Project != plan.OldCWD {
+			return line
+		}
+		out := replaceTopLevelStringField(line, "project", plan.OldCWD, plan.NewCWD)
+		if bytes.Equal(line, out) {
+			rewriteErr = errors.New("selected history entry still contains the old project after rewrite")
+		}
+		if plan.Mode == session.ModeCopy.String() {
+			return append(append(append([]byte{}, line...), '\n'), out...)
+		}
+		return out
+	})
+	if err != nil {
+		return err
+	}
+	return rewriteErr
 }
 
 // rewriteJSONLField rewrites a top-level string field across every line of a

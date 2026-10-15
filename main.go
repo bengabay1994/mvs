@@ -3,8 +3,8 @@
 // Subcommands:
 //
 //	mvs                    interactive TUI (default)
-//	mvs list               print every (agent, cwd) group found on this host
-//	mvs migrate FROM TO    non-interactive migration (use --agent to scope)
+//	mvs list               print individual sessions (or --project groups)
+//	mvs migrate FROM TO    select --session ID or --project explicitly
 //	mvs undo RUN_ID        roll back a prior run from the backup snapshot
 //	mvs doctor             print which agents are available and where
 package main
@@ -29,10 +29,12 @@ import (
 const usage = `mvs — migrate agent session history between project directories
 
 usage:
-  mvs                     interactive TUI (default)
-  mvs list                show every (agent, cwd) group
-  mvs migrate FROM TO     migrate sessions whose old cwd = FROM to TO
+  mvs                     interactive session picker (tab: switch to projects)
+  mvs list [--project]     show sessions with IDs, or whole project groups
+  mvs migrate FROM TO     move selected sessions from FROM to TO
                           flags: --agent <claude|codex|gemini|opencode>
+                                 --session <ID> select a session (repeatable)
+                                 --project migrate every session at FROM
                                  --copy    duplicate instead of moving
                                  --dry-run plan only, no writes
   mvs undo RUN_ID         restore from a backup snapshot
@@ -56,7 +58,7 @@ func main() {
 	case "--version":
 		fmt.Println("mvs", version)
 	case "list":
-		runList()
+		runList(os.Args[2:])
 	case "doctor":
 		runDoctor()
 	case "migrate":
@@ -84,14 +86,25 @@ func runTUI(mode session.Mode) {
 	}
 }
 
-func runList() {
+func runList(args []string) {
+	fs := flag.NewFlagSet("list", flag.ExitOnError)
+	projects := fs.Bool("project", false, "group all sessions by agent and project")
+	_ = fs.Parse(args)
 	groups := scanGroups()
 	if len(groups) == 0 {
 		fmt.Println("(no sessions found)")
 		return
 	}
 	for _, g := range groups {
-		fmt.Printf("[%s] %s  (%d sessions)\n", g.Agent, g.CWD, len(g.Sessions))
+		if *projects {
+			fmt.Printf("[%s] %s  (%d sessions)\n", g.Agent, g.CWD, len(g.Sessions))
+			continue
+		}
+		for _, s := range g.Sessions {
+			if !s.ProjectOnly {
+				fmt.Printf("[%s] %s  %s  %s\n", s.Agent, s.ID, s.CWD, strings.Join(strings.Fields(s.Title), " "))
+			}
+		}
 	}
 }
 
@@ -123,6 +136,9 @@ func runMigrate(args []string) {
 	agentFlag := fs.String("agent", "", "limit to a single agent (claude|codex|gemini|opencode)")
 	copyMode := fs.Bool("copy", false, "duplicate instead of moving")
 	dryRun := fs.Bool("dry-run", false, "print the plan; don't write")
+	projects := fs.Bool("project", false, "migrate every session in each matching project")
+	var ids sessionFlags
+	fs.Var(&ids, "session", "session ID to migrate (repeatable; see mvs list)")
 	if err := fs.Parse(args); err != nil {
 		os.Exit(2)
 	}
@@ -142,31 +158,8 @@ func runMigrate(args []string) {
 		mode = session.ModeCopy
 	}
 
-	groups := scanGroups()
-	var planned []session.Plan
-	for _, g := range groups {
-		if g.CWD != from {
-			continue
-		}
-		if *agentFlag != "" && g.Agent != *agentFlag {
-			continue
-		}
-		a, err := adapter.ByName(g.Agent)
-		if err != nil {
-			continue
-		}
-		p, err := a.Plan(g.Sessions, session.PlanOpts{NewCWD: to, Mode: mode})
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "plan:", err)
-			os.Exit(1)
-		}
-		planned = append(planned, p)
-	}
-	if len(planned) == 0 {
-		fmt.Fprintln(os.Stderr, "no sessions match", from)
-		os.Exit(1)
-	}
-	if err := migration.Validate(planned); err != nil {
+	planned, err := planMigration(scanGroups(), from, to, *agentFlag, ids, *projects, mode)
+	if err != nil {
 		fmt.Fprintln(os.Stderr, "plan:", err)
 		os.Exit(1)
 	}
@@ -187,6 +180,78 @@ func runMigrate(args []string) {
 	}
 	fmt.Println("backup id:", runID)
 	fmt.Println("undo with: mvs undo", runID)
+}
+
+type sessionFlags []string
+
+func (s *sessionFlags) String() string { return strings.Join(*s, ", ") }
+func (s *sessionFlags) Set(value string) error {
+	if strings.TrimSpace(value) == "" {
+		return fmt.Errorf("session ID must not be empty")
+	}
+	*s = append(*s, value)
+	return nil
+}
+
+func planMigration(groups []tui.Group, from, to, agent string, ids []string, projects bool, mode session.Mode) ([]session.Plan, error) {
+	if projects && len(ids) > 0 {
+		return nil, fmt.Errorf("--project and --session cannot be combined")
+	}
+	if !projects && len(ids) == 0 {
+		return nil, fmt.Errorf("select --session ID (see mvs list), or --project to migrate all sessions")
+	}
+	requested := make(map[string]int, len(ids))
+	for _, id := range ids {
+		requested[id] = 0
+	}
+	scope := session.ScopeSession
+	if projects {
+		scope = session.ScopeProject
+	}
+	var planned []session.Plan
+	for _, g := range groups {
+		if g.CWD != from || (agent != "" && g.Agent != agent) {
+			continue
+		}
+		var selected []session.Session
+		for _, s := range g.Sessions {
+			if projects {
+				selected = append(selected, s)
+				continue
+			}
+			if _, ok := requested[s.ID]; ok && !s.ProjectOnly {
+				selected = append(selected, s)
+				requested[s.ID]++
+			}
+		}
+		if len(selected) == 0 {
+			continue
+		}
+		a, err := adapter.ByName(g.Agent)
+		if err != nil {
+			return nil, err
+		}
+		p, err := a.Plan(selected, session.PlanOpts{NewCWD: to, Mode: mode, Scope: scope})
+		if err != nil {
+			return nil, err
+		}
+		planned = append(planned, p)
+	}
+	for id, count := range requested {
+		if count == 0 {
+			return nil, fmt.Errorf("session %q was not found at %s for the selected agent", id, from)
+		}
+		if count > 1 {
+			return nil, fmt.Errorf("session ID %q is ambiguous; use --agent to select its agent", id)
+		}
+	}
+	if len(planned) == 0 {
+		return nil, fmt.Errorf("no sessions match %s", from)
+	}
+	if err := migration.Validate(planned); err != nil {
+		return nil, err
+	}
+	return planned, nil
 }
 
 func runUndo(args []string) {
@@ -259,6 +324,9 @@ func scanGroups() []tui.Group {
 func printPlans(plans []session.Plan) {
 	for _, p := range plans {
 		fmt.Printf("[%s] %s → %s (%s)\n", p.Agent, p.OldCWD, p.NewCWD, p.Mode)
+		if p.Scope == session.ScopeSession.String() {
+			fmt.Println("    selected sessions:", strings.Join(p.SessionIDs, ", "))
+		}
 		for _, a := range p.Actions {
 			detail := a.Detail
 			if detail != "" {
